@@ -1,19 +1,23 @@
+// WebDAV MP3 player for the M5Stack Cardputer ADV - stripped-down version.
+// Based on CardputerADV-NAS-mp3player 1.4.0 (HardCore-Gamer). Kept: Wi-Fi, server address,
+// folder browsing, playback. Removed: search, sleep timer, eco mode, resume on boot, seeking,
+// clock, help screen.
+// Audio: one task streams the network into a large ring buffer, another task decodes the MP3;
+// drawing the screen or reading the keyboard can no longer interrupt the sound.
+// One folder = one playlist: every MP3 of the folder is played in order, then playback stops.
 #include <Arduino.h>
 #include <M5Cardputer.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
-#include <esp_sleep.h>
-#include <esp_system.h>
-#include <time.h>
+#include <esp_heap_caps.h>
 
 #include <AudioFileSource.h>
-#include <AudioFileSourceBuffer.h>
-#include <AudioFileSourceID3.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioOutput.h>
 
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 namespace {
@@ -22,17 +26,9 @@ constexpr int SCREEN_W = 240;
 constexpr int SCREEN_H = 135;
 constexpr int HEADER_H = 20;
 constexpr int FOOTER_H = 15;
-constexpr size_t MAX_LIST_BODY = 96 * 1024;
-constexpr size_t MAX_ENTRIES = 120;
-constexpr uint32_t RESUME_SAVE_INTERVAL_MS = 3000;
-constexpr uint32_t SEEK_STEP_MIN_BYTES = 96 * 1024;
-constexpr uint32_t POWER_SAVE_IDLE_MS = 15000;
-constexpr uint32_t POWER_SAVE_SCREEN_OFF_MS = 35000;
-constexpr uint32_t BAD_PLAYBACK_TIME_MS = 2000;
-constexpr uint32_t BAD_PLAYBACK_POS_BYTES = 32 * 1024;
-constexpr uint8_t DISPLAY_BRIGHTNESS_ACTIVE = 128;
-constexpr uint8_t DISPLAY_BRIGHTNESS_DIM = 18;
-constexpr uint8_t DISPLAY_BRIGHTNESS_OFF = 0;
+constexpr size_t MAX_ENTRIES = 1000;
+constexpr uint32_t MIN_FREE_HEAP_FOR_LIST = 40 * 1024;
+constexpr uint32_t NET_TIMEOUT_MS = 20000;
 
 constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
@@ -63,9 +59,10 @@ struct ParsedUrl {
     String path = "/";
 };
 
+// Folder entry: only the last (encoded) path segment is stored to save memory;
+// the full URL is rebuilt from the current folder.
 struct FileEntry {
-    String name;
-    String url;
+    String seg;
     bool dir = false;
     bool parent = false;
 };
@@ -88,107 +85,46 @@ struct KeyEvent {
     std::vector<char> chars;
 };
 
-enum class Screen {
-    WifiList,
-    TextInput,
-    FileList,
-    Player,
-    TimerMenu,
-    Message,
-};
-
-enum class InputMode {
-    None,
-    WifiPassword,
-    ManualSsid,
-    NasUrl,
-    FileSearch,
-};
+enum class Screen { WifiList, TextInput, FileList, Player, Message };
+enum class InputMode { None, WifiPassword, ManualSsid, NasUrl };
 
 Preferences prefs;
 Screen screen = Screen::Message;
 Screen returnAfterMessage = Screen::WifiList;
-Screen wifiReturnScreen = Screen::Message;
 InputMode inputMode = InputMode::None;
 
 std::vector<WifiItem> wifiItems;
-std::vector<FileEntry> allEntries;
 std::vector<FileEntry> entries;
+bool listTruncated = false;
 
 String savedSsid;
 String savedPass;
 String savedNas;
-String savedResumeUrl;
 String pendingSsid;
 String inputText;
 String inputTitle;
-String fileSearchQuery;
 bool inputSecret = false;
 
-String currentUrl;
-String currentTrackName;
-String currentTrackUrl;
+String currentUrl;  // folder being shown (ends with '/')
 int selected = 0;
 int scrollTop = 0;
 int wifiSelected = 0;
 int wifiScrollTop = 0;
-int timerSelected = 0;
 int volume = 180;
-uint32_t savedResumePos = 0;
-bool powerSaveEnabled = true;
-bool playerDimmed = false;
-bool playerScreenOff = false;
-uint32_t lastUserActionAt = 0;
 
 uint32_t messageUntil = 0;
 String messageTitle;
 String messageBody;
-uint32_t shutdownAt = 0;
-uint32_t lastPlayerRedraw = 0;
-uint32_t lastResumeSaveAt = 0;
-uint32_t playbackStartedAt = 0;
 bool needsRedraw = true;
-bool showHelpOverlay = false;
 bool bootAutoStartPending = false;
-bool skipPlaybackLoopOnce = false;
-esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
-bool timeSyncRequested = false;
 
-int lastHeaderWifiBars = -2;
-bool lastHeaderWifiConnected = false;
-int lastHeaderBattery = -2;
-int lastHeaderCharging = -2;
-String lastHeaderClockShown;
-uint32_t lastPlayerPosShown = UINT32_MAX;
-uint32_t lastPlayerSizeShown = UINT32_MAX;
-int lastPlayerVolumeShown = -1;
-String lastPlayerTimerShown;
-String lastPlayerStateShown;
+// Playlist = the folder where playback was started.
+String playlistDir;
+std::vector<String> playlist;
+int playIndex = -1;
+int failedInRow = 0;
 
-AudioGeneratorMP3 *mp3 = nullptr;
-AudioFileSource *httpSource = nullptr;
-AudioFileSourceBuffer *buffSource = nullptr;
-AudioFileSourceID3 *id3Source = nullptr;
-
-String normalizeNasUrl(const String &raw);
-bool loadDirectory(const String &url);
-void startPlayback(int index, uint32_t offset = 0, bool fallbackToZero = true);
-void stopPlayback(bool keepResume = true);
-void drawFileList();
-void drawPlayer();
-void drawPlayerDynamic(bool force = false);
-bool tryAutoStart();
-void wakePlayerDisplay();
-void markUserActivity();
-void applyFileSearch();
-void drawHelpOverlay();
-void scanWifi();
-bool isAbnormalPlaybackReset(esp_reset_reason_t reason);
-void drawBusyScreen(const String &title, const String &body);
-void prepareSingleTrackContext(const String &url);
-bool ensurePlaybackFolderLoaded(const String &failNextScreenText);
-void syncClockIfNeeded();
-String headerClockText();
+// --------------------------------------------------------------------- text / URL helpers
 
 String toLowerCopy(String value) {
     value.toLowerCase();
@@ -232,9 +168,9 @@ int hexValue(char c) {
 String percentDecode(const String &value) {
     String out;
     out.reserve(value.length());
-    for (int i = 0; i < value.length(); ++i) {
+    for (int i = 0; i < static_cast<int>(value.length()); ++i) {
         char c = value[i];
-        if (c == '%' && i + 2 < value.length()) {
+        if (c == '%' && i + 2 < static_cast<int>(value.length())) {
             int hi = hexValue(value[i + 1]);
             int lo = hexValue(value[i + 2]);
             if (hi >= 0 && lo >= 0) {
@@ -243,11 +179,7 @@ String percentDecode(const String &value) {
                 continue;
             }
         }
-        if (c == '+') {
-            out += ' ';
-        } else {
-            out += c;
-        }
+        out += c == '+' ? ' ' : c;
     }
     return out;
 }
@@ -255,15 +187,6 @@ String percentDecode(const String &value) {
 String trimCopy(String value) {
     value.trim();
     return value;
-}
-
-bool containsIgnoreCase(const String &text, const String &needle) {
-    if (needle.isEmpty()) {
-        return true;
-    }
-    String hay = toLowerCopy(text);
-    String ndl = toLowerCopy(needle);
-    return hay.indexOf(ndl) >= 0;
 }
 
 ParsedUrl parseUrl(String raw) {
@@ -275,7 +198,6 @@ ParsedUrl parseUrl(String raw) {
     if (raw.indexOf("://") < 0) {
         raw = "http://" + raw;
     }
-
     int schemeEnd = raw.indexOf("://");
     if (schemeEnd <= 0) {
         return out;
@@ -285,7 +207,6 @@ ParsedUrl parseUrl(String raw) {
     if (out.scheme != "http") {
         return out;
     }
-
     int authorityStart = schemeEnd + 3;
     int pathStart = raw.indexOf('/', authorityStart);
     String authority = pathStart >= 0 ? raw.substring(authorityStart, pathStart) : raw.substring(authorityStart);
@@ -293,7 +214,6 @@ ParsedUrl parseUrl(String raw) {
     if (out.path.isEmpty()) {
         out.path = "/";
     }
-
     int at = authority.lastIndexOf('@');
     if (at >= 0) {
         String userInfo = authority.substring(0, at);
@@ -306,7 +226,6 @@ ParsedUrl parseUrl(String raw) {
             out.user = percentDecode(userInfo);
         }
     }
-
     int portSep = authority.lastIndexOf(':');
     if (portSep > 0) {
         out.host = authority.substring(0, portSep);
@@ -317,7 +236,6 @@ ParsedUrl parseUrl(String raw) {
     } else {
         out.host = authority;
     }
-
     out.host.trim();
     out.ok = !out.host.isEmpty();
     return out;
@@ -341,17 +259,19 @@ String buildOrigin(const ParsedUrl &url, bool includeAuth) {
     return out;
 }
 
-String ensureDirectoryUrl(String url) {
-    String low = toLowerCopy(url);
-    int q = low.indexOf('?');
-    String pathOnly = q >= 0 ? low.substring(0, q) : low;
-    if (!pathOnly.endsWith(".mp3") && !url.endsWith("/")) {
-        url += "/";
+String cleanUrlPath(String path) {
+    int query = path.indexOf('?');
+    if (query >= 0) {
+        path.remove(query);
     }
-    return url;
+    int fragment = path.indexOf('#');
+    if (fragment >= 0) {
+        path.remove(fragment);
+    }
+    return path;
 }
 
-String normalizeNasUrl(const String &raw) {
+String normalizeDirUrl(const String &raw) {
     String url = trimCopy(raw);
     if (url.indexOf("://") < 0) {
         url = "http://" + url;
@@ -360,8 +280,11 @@ String normalizeNasUrl(const String &raw) {
     if (!parsed.ok) {
         return url;
     }
-    url = buildOrigin(parsed, true) + parsed.path;
-    return ensureDirectoryUrl(url);
+    String path = cleanUrlPath(parsed.path);
+    if (!path.endsWith("/")) {
+        path += "/";
+    }
+    return buildOrigin(parsed, true) + path;
 }
 
 String joinUrl(const String &baseUrl, String href) {
@@ -377,21 +300,15 @@ String joinUrl(const String &baseUrl, String href) {
         }
         return href;
     }
-
     ParsedUrl base = parseUrl(baseUrl);
     if (!base.ok) {
         return href;
     }
-
     String path;
     if (href.startsWith("/")) {
         path = href;
     } else {
-        path = base.path;
-        int query = path.indexOf('?');
-        if (query >= 0) {
-            path.remove(query);
-        }
+        path = cleanUrlPath(base.path);
         if (!path.endsWith("/")) {
             int slash = path.lastIndexOf('/');
             path = slash >= 0 ? path.substring(0, slash + 1) : "/";
@@ -401,20 +318,24 @@ String joinUrl(const String &baseUrl, String href) {
     return buildOrigin(base, true) + path;
 }
 
-String fileNameFromUrl(const String &url) {
+String lastSegment(const String &url) {
     ParsedUrl parsed = parseUrl(url);
-    String path = parsed.ok ? parsed.path : url;
-    int query = path.indexOf('?');
-    if (query >= 0) {
-        path.remove(query);
-    }
+    String path = cleanUrlPath(parsed.ok ? parsed.path : url);
     if (path.endsWith("/") && path.length() > 1) {
         path.remove(path.length() - 1);
     }
     int slash = path.lastIndexOf('/');
-    String name = slash >= 0 ? path.substring(slash + 1) : path;
-    name = percentDecode(xmlHtmlDecode(name));
-    return name.isEmpty() ? url : name;
+    return slash >= 0 ? path.substring(slash + 1) : path;
+}
+
+String segToName(const String &seg) {
+    return percentDecode(xmlHtmlDecode(seg));
+}
+
+String segToUrlPart(const String &seg) {
+    String s = seg;
+    s.replace(" ", "%20");
+    return s;
 }
 
 String parentUrlOf(const String &url) {
@@ -422,11 +343,7 @@ String parentUrlOf(const String &url) {
     if (!parsed.ok) {
         return url;
     }
-    String path = parsed.path;
-    int query = path.indexOf('?');
-    if (query >= 0) {
-        path.remove(query);
-    }
+    String path = cleanUrlPath(parsed.path);
     if (path.length() <= 1) {
         return buildOrigin(parsed, true) + "/";
     }
@@ -438,22 +355,19 @@ String parentUrlOf(const String &url) {
     return buildOrigin(parsed, true) + path;
 }
 
+bool isRootUrl(const String &url) {
+    ParsedUrl parsed = parseUrl(url);
+    return !parsed.ok || cleanUrlPath(parsed.path).length() <= 1;
+}
+
 bool samePathUrl(const String &a, const String &b) {
     ParsedUrl pa = parseUrl(a);
     ParsedUrl pb = parseUrl(b);
     if (!pa.ok || !pb.ok) {
         return a == b;
     }
-    String ap = pa.path;
-    String bp = pb.path;
-    int aq = ap.indexOf('?');
-    int bq = bp.indexOf('?');
-    if (aq >= 0) {
-        ap.remove(aq);
-    }
-    if (bq >= 0) {
-        bp.remove(bq);
-    }
+    String ap = cleanUrlPath(pa.path);
+    String bp = cleanUrlPath(pb.path);
     if (!ap.endsWith("/")) {
         ap += "/";
     }
@@ -463,25 +377,12 @@ bool samePathUrl(const String &a, const String &b) {
     return pa.host == pb.host && pa.port == pb.port && ap == bp;
 }
 
-String cleanUrlPath(String path) {
-    int query = path.indexOf('?');
-    if (query >= 0) {
-        path.remove(query);
-    }
-    int fragment = path.indexOf('#');
-    if (fragment >= 0) {
-        path.remove(fragment);
-    }
-    return path;
-}
-
 bool isDirectChildUrl(const String &baseUrl, const String &targetUrl, bool directory) {
     ParsedUrl base = parseUrl(baseUrl);
     ParsedUrl target = parseUrl(targetUrl);
     if (!base.ok || !target.ok || base.host != target.host || base.port != target.port) {
         return false;
     }
-
     String basePath = cleanUrlPath(base.path);
     String targetPath = cleanUrlPath(target.path);
     if (!basePath.endsWith("/")) {
@@ -490,7 +391,6 @@ bool isDirectChildUrl(const String &baseUrl, const String &targetUrl, bool direc
     if (!targetPath.startsWith(basePath) || targetPath == basePath) {
         return false;
     }
-
     String child = targetPath.substring(basePath.length());
     if (directory && child.endsWith("/")) {
         child.remove(child.length() - 1);
@@ -499,17 +399,412 @@ bool isDirectChildUrl(const String &baseUrl, const String &targetUrl, bool direc
 }
 
 bool pathIsMp3(const String &urlOrPath) {
-    String low = toLowerCopy(urlOrPath);
-    int hash = low.indexOf('#');
-    if (hash >= 0) {
-        low.remove(hash);
-    }
-    int query = low.indexOf('?');
-    if (query >= 0) {
-        low.remove(query);
-    }
-    return low.endsWith(".mp3");
+    return toLowerCopy(cleanUrlPath(urlOrPath)).endsWith(".mp3");
 }
+
+// "Natural" sort: "2 - x" before "10 - x".
+bool naturalLess(const String &a, const String &b) {
+    size_t i = 0;
+    size_t j = 0;
+    while (i < a.length() && j < b.length()) {
+        char ca = a[i];
+        char cb = b[j];
+        if (isdigit(static_cast<unsigned char>(ca)) && isdigit(static_cast<unsigned char>(cb))) {
+            uint32_t na = 0;
+            uint32_t nb = 0;
+            while (i < a.length() && isdigit(static_cast<unsigned char>(a[i]))) {
+                na = na * 10 + (a[i++] - '0');
+            }
+            while (j < b.length() && isdigit(static_cast<unsigned char>(b[j]))) {
+                nb = nb * 10 + (b[j++] - '0');
+            }
+            if (na != nb) {
+                return na < nb;
+            }
+            continue;
+        }
+        if (ca != cb) {
+            return static_cast<unsigned char>(ca) < static_cast<unsigned char>(cb);
+        }
+        ++i;
+        ++j;
+    }
+    return a.length() - i < b.length() - j;
+}
+
+String formatTime(uint32_t ms) {
+    uint32_t s = ms / 1000;
+    char buf[16];
+    if (s >= 3600) {
+        snprintf(buf, sizeof(buf), "%lu:%02lu:%02lu", static_cast<unsigned long>(s / 3600),
+                 static_cast<unsigned long>((s / 60) % 60), static_cast<unsigned long>(s % 60));
+    } else {
+        snprintf(buf, sizeof(buf), "%02lu:%02lu", static_cast<unsigned long>(s / 60),
+                 static_cast<unsigned long>(s % 60));
+    }
+    return String(buf);
+}
+
+// --------------------------------------------------------------------- audio engine
+
+// Ring buffer: the network task writes, the decode task reads.
+uint8_t *ringBuf = nullptr;
+size_t ringCap = 0;
+std::atomic<uint32_t> ringHead{0};
+std::atomic<uint32_t> ringTail{0};
+
+inline size_t ringAvail() {
+    return ringHead.load() - ringTail.load();
+}
+
+inline size_t ringFree() {
+    return ringCap - ringAvail();
+}
+
+void ringPeek(uint8_t *dst, size_t len) {
+    uint32_t tail = ringTail.load();
+    for (size_t i = 0; i < len; ++i) {
+        dst[i] = ringBuf[(tail + i) % ringCap];
+    }
+}
+
+void ringDiscard(size_t len) {
+    ringTail.store(ringTail.load() + len);
+}
+
+WiFiClient netClient;
+HTTPClient netHttp;
+Client *netStream = nullptr;
+SemaphoreHandle_t netMutex = nullptr;
+std::atomic<bool> netActive{false};
+std::atomic<bool> netEof{false};
+std::atomic<bool> netError{false};
+std::atomic<uint32_t> netTotal{0};
+std::atomic<uint32_t> netReceived{0};
+
+enum PlayState : int { PS_IDLE = 0, PS_PLAYING, PS_PAUSED, PS_DONE };
+std::atomic<int> playState{PS_IDLE};
+std::atomic<bool> stopReq{false};
+std::atomic<uint32_t> underruns{0};
+SemaphoreHandle_t decMutex = nullptr;
+AudioGeneratorMP3 *mp3 = nullptr;
+
+String trackName;
+uint32_t trackDurationMs = 0;
+uint32_t trackKbps = 0;
+
+void netTask(void *) {
+    uint32_t lastData = millis();
+    for (;;) {
+        if (!netActive.load()) {
+            lastData = millis();
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        bool worked = false;
+        xSemaphoreTake(netMutex, portMAX_DELAY);
+        if (netActive.load() && netStream != nullptr) {
+            size_t freeBytes = ringFree();
+            int avail = netStream->available();
+            if (avail > 0 && freeBytes > 0) {
+                uint32_t head = ringHead.load();
+                size_t pos = head % ringCap;
+                size_t n = std::min<size_t>(freeBytes, ringCap - pos);
+                n = std::min<size_t>(n, static_cast<size_t>(avail));
+                n = std::min<size_t>(n, 4096);
+                int got = netStream->read(ringBuf + pos, n);
+                if (got > 0) {
+                    ringHead.store(head + got);
+                    netReceived.store(netReceived.load() + got);
+                    lastData = millis();
+                    worked = true;
+                }
+            } else if (avail <= 0) {
+                uint32_t total = netTotal.load();
+                bool finished = (total > 0 && netReceived.load() >= total) || !netHttp.connected();
+                if (finished) {
+                    netEof.store(true);
+                    netActive.store(false);
+                } else if (millis() - lastData > NET_TIMEOUT_MS) {
+                    netError.store(true);
+                    netEof.store(true);
+                    netActive.store(false);
+                }
+            } else {
+                lastData = millis();  // buffer full: wait for the decoder
+            }
+        }
+        xSemaphoreGive(netMutex);
+        vTaskDelay(worked ? 1 : pdMS_TO_TICKS(4));
+    }
+}
+
+// Source read by the decoder: waits for data instead of returning short reads
+// (the MP3 decoder gives up after 3 incomplete reads in a row).
+class RingSource : public AudioFileSource {
+public:
+    uint32_t read(void *data, uint32_t len) override {
+        uint8_t *out = static_cast<uint8_t *>(data);
+        uint32_t done = 0;
+        while (done < len && !stopReq.load()) {
+            size_t avail = ringAvail();
+            if (avail == 0) {
+                if (netEof.load()) {
+                    break;
+                }
+                // Underrun: let the buffer refill before resuming.
+                underruns.store(underruns.load() + 1);
+                size_t target = std::min<size_t>(ringCap / 2, 32 * 1024);
+                while (!stopReq.load() && !netEof.load() && ringAvail() < target) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+                continue;
+            }
+            uint32_t tail = ringTail.load();
+            size_t pos = tail % ringCap;
+            size_t n = std::min<size_t>(avail, len - done);
+            n = std::min<size_t>(n, ringCap - pos);
+            memcpy(out + done, ringBuf + pos, n);
+            ringTail.store(tail + n);
+            done += n;
+            pos_ += n;
+        }
+        return done;
+    }
+    uint32_t readNonBlock(void *data, uint32_t len) override {
+        return read(data, len);
+    }
+    bool seek(int32_t, int) override {
+        return false;
+    }
+    bool close() override {
+        return true;
+    }
+    bool isOpen() override {
+        return true;
+    }
+    uint32_t getSize() override {
+        return netTotal.load();
+    }
+    uint32_t getPos() override {
+        return pos_;
+    }
+    void reset(uint32_t startPos) {
+        pos_ = startPos;
+    }
+
+private:
+    uint32_t pos_ = 0;
+};
+
+RingSource ringSource;
+
+// Output to the speaker (ES8311 codec through M5Unified). playRaw() waits for a free queue
+// slot: this is what paces the decode task.
+class AudioOutputM5Speaker : public AudioOutput {
+public:
+    bool begin() override {
+        return true;
+    }
+    bool ConsumeSample(int16_t sample[2]) override {
+        if (bufPos_ + 1 >= BUF_SAMPLES) {
+            flush();
+            return false;
+        }
+        buf_[bufIndex_][bufPos_++] = sample[0];
+        buf_[bufIndex_][bufPos_++] = sample[1];
+        return true;
+    }
+    bool stop() override {
+        bufPos_ = 0;
+        return true;
+    }
+    bool SetRate(int hz) override {
+        sampleRate_ = hz;
+        return true;
+    }
+    bool SetBitsPerSample(int bits) override {
+        return bits == 16;
+    }
+    bool SetChannels(int channels) override {
+        return channels == 1 || channels == 2;
+    }
+    void flush() override {
+        if (bufPos_ == 0) {
+            return;
+        }
+        M5Cardputer.Speaker.playRaw(buf_[bufIndex_], bufPos_, sampleRate_, true, 1, 0);
+        frames_.store(frames_.load() + bufPos_ / 2);
+        bufIndex_ = (bufIndex_ + 1) % 3;
+        bufPos_ = 0;
+    }
+    void resetCounter() {
+        frames_.store(0);
+        bufPos_ = 0;
+    }
+    uint32_t elapsedMs() const {
+        return sampleRate_ > 0 ? static_cast<uint32_t>(static_cast<uint64_t>(frames_.load()) * 1000ULL / sampleRate_) : 0;
+    }
+
+private:
+    static constexpr size_t BUF_SAMPLES = 4096;  // 2048 stereo frames, ~46 ms at 44.1 kHz
+    int16_t buf_[3][BUF_SAMPLES] = {};
+    size_t bufPos_ = 0;
+    uint8_t bufIndex_ = 0;
+    int sampleRate_ = 44100;
+    std::atomic<uint32_t> frames_{0};
+};
+
+AudioOutputM5Speaker out;
+
+void decodeTask(void *) {
+    for (;;) {
+        if (playState.load() != PS_PLAYING || stopReq.load()) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        xSemaphoreTake(decMutex, portMAX_DELAY);
+        if (mp3 != nullptr && playState.load() == PS_PLAYING && !stopReq.load()) {
+            if (!mp3->loop() && !stopReq.load()) {
+                out.flush();
+                playState.store(PS_DONE);
+            }
+        }
+        xSemaphoreGive(decMutex);
+        taskYIELD();
+    }
+}
+
+uint32_t be32(const uint8_t *p) {
+    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) | p[3];
+}
+
+// Reads the first MP3 frame header: bitrate, and frame count (Xing/Info/VBRI header)
+// for an exact duration, including variable bitrate files.
+void parseMp3Header(const uint8_t *b, size_t n, uint32_t audioBytes) {
+    static const uint16_t br1[16] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
+    static const uint16_t br2[16] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0};
+    static const uint32_t sr[3] = {44100, 48000, 32000};
+    for (size_t i = 0; i + 4 <= n; ++i) {
+        if (b[i] != 0xFF || (b[i + 1] & 0xE0) != 0xE0) {
+            continue;
+        }
+        int ver = (b[i + 1] >> 3) & 3;  // 3 = MPEG1, 2 = MPEG2, 0 = MPEG2.5
+        int layer = (b[i + 1] >> 1) & 3;  // 1 = Layer III
+        int brIdx = (b[i + 2] >> 4) & 0xF;
+        int srIdx = (b[i + 2] >> 2) & 3;
+        int chMode = (b[i + 3] >> 6) & 3;
+        if (ver == 1 || layer != 1 || brIdx == 0 || brIdx == 15 || srIdx == 3) {
+            continue;
+        }
+        uint32_t rate = sr[srIdx] >> (ver == 3 ? 0 : (ver == 2 ? 1 : 2));
+        uint32_t kbps = ver == 3 ? br1[brIdx] : br2[brIdx];
+        uint32_t spf = ver == 3 ? 1152 : 576;
+        size_t side = ver == 3 ? (chMode == 3 ? 17 : 32) : (chMode == 3 ? 9 : 17);
+        trackKbps = kbps;
+        size_t x = i + 4 + side;
+        if (x + 12 <= n && (memcmp(b + x, "Xing", 4) == 0 || memcmp(b + x, "Info", 4) == 0)) {
+            uint32_t flags = be32(b + x + 4);
+            if (flags & 1) {
+                uint32_t frames = be32(b + x + 8);
+                if (frames > 0) {
+                    trackDurationMs = static_cast<uint32_t>(static_cast<uint64_t>(frames) * spf * 1000ULL / rate);
+                    if (flags & 2 && trackDurationMs > 0) {
+                        trackKbps = static_cast<uint32_t>(static_cast<uint64_t>(be32(b + x + 12)) * 8ULL / trackDurationMs);
+                    }
+                    return;
+                }
+            }
+        }
+        size_t v = i + 4 + 32;
+        if (v + 18 <= n && memcmp(b + v, "VBRI", 4) == 0) {
+            uint32_t frames = be32(b + v + 14);
+            if (frames > 0) {
+                trackDurationMs = static_cast<uint32_t>(static_cast<uint64_t>(frames) * spf * 1000ULL / rate);
+                return;
+            }
+        }
+        if (audioBytes > 0 && kbps > 0) {
+            trackDurationMs = static_cast<uint32_t>(static_cast<uint64_t>(audioBytes) * 8ULL / kbps);
+        }
+        return;
+    }
+}
+
+bool waitRing(size_t bytes, uint32_t timeoutMs) {
+    uint32_t start = millis();
+    while (ringAvail() < bytes && !netEof.load()) {
+        if (millis() - start > timeoutMs) {
+            return false;
+        }
+        M5Cardputer.update();
+        delay(5);
+    }
+    return ringAvail() >= bytes || netEof.load();
+}
+
+void stopTrack() {
+    stopReq.store(true);
+    xSemaphoreTake(decMutex, portMAX_DELAY);
+    if (mp3 != nullptr) {
+        mp3->stop();
+        delete mp3;
+        mp3 = nullptr;
+    }
+    playState.store(PS_IDLE);
+    xSemaphoreGive(decMutex);
+    M5Cardputer.Speaker.stop();
+    out.resetCounter();
+    xSemaphoreTake(netMutex, portMAX_DELAY);
+    netActive.store(false);
+    netHttp.end();
+    netStream = nullptr;
+    ringHead.store(0);
+    ringTail.store(0);
+    netEof.store(false);
+    netError.store(false);
+    xSemaphoreGive(netMutex);
+    stopReq.store(false);
+}
+
+bool openStream(const String &url) {
+    ParsedUrl parsed = parseUrl(url);
+    if (!parsed.ok) {
+        return false;
+    }
+    xSemaphoreTake(netMutex, portMAX_DELAY);
+    netClient.setTimeout(10000);
+    bool ok = netHttp.begin(netClient, buildOrigin(parsed, false) + parsed.path);
+    if (ok) {
+        netHttp.setTimeout(12000);
+        netHttp.setReuse(false);
+        netHttp.useHTTP10(true);
+        netHttp.addHeader("User-Agent", "CardputerAdvMP3/2.0");
+        if (!parsed.user.isEmpty()) {
+            netHttp.setAuthorization(parsed.user.c_str(), parsed.pass.c_str());
+        }
+        int code = netHttp.GET();
+        ok = code == HTTP_CODE_OK;
+        if (ok) {
+            netStream = netHttp.getStreamPtr();
+            int size = netHttp.getSize();
+            netTotal.store(size > 0 ? static_cast<uint32_t>(size) : 0);
+            netReceived.store(0);
+            ringHead.store(0);
+            ringTail.store(0);
+            netEof.store(false);
+            netError.store(false);
+            netActive.store(true);
+        } else {
+            netHttp.end();
+        }
+    }
+    xSemaphoreGive(netMutex);
+    return ok;
+}
+
+// --------------------------------------------------------------------- display
 
 String displayFit(String value, int width) {
     if (M5Cardputer.Display.textWidth(value) <= width) {
@@ -526,79 +821,13 @@ String tailFit(String value, int width) {
         return value;
     }
     while (!value.isEmpty() && M5Cardputer.Display.textWidth("..." + value) > width) {
-        int i = 0;
-        if (value.length() > 1) {
-            i = 1;
-            while (i < value.length() && ((static_cast<uint8_t>(value[i]) & 0xC0) == 0x80)) {
-                ++i;
-            }
+        int i = 1;
+        while (i < static_cast<int>(value.length()) && ((static_cast<uint8_t>(value[i]) & 0xC0) == 0x80)) {
+            ++i;
         }
         value.remove(0, i);
     }
     return "..." + value;
-}
-
-uint32_t currentPlaybackPos() {
-    return id3Source ? id3Source->getPos() : 0;
-}
-
-uint32_t currentPlaybackSize() {
-    return id3Source ? id3Source->getSize() : 0;
-}
-
-void saveResumeState(const String &url, uint32_t pos) {
-    savedResumeUrl = url;
-    savedResumePos = pos;
-    prefs.putString("resume_url", savedResumeUrl);
-    prefs.putUInt("resume_pos", savedResumePos);
-}
-
-void clearResumeState() {
-    saveResumeState("", 0);
-}
-
-void persistPlaybackState(bool force) {
-    if (currentTrackUrl.isEmpty()) {
-        return;
-    }
-    uint32_t now = millis();
-    if (!force && now - lastResumeSaveAt < RESUME_SAVE_INTERVAL_MS) {
-        return;
-    }
-    saveResumeState(currentTrackUrl, currentPlaybackPos());
-    lastResumeSaveAt = now;
-}
-
-int findEntryIndexByUrl(const String &url) {
-    for (size_t i = 0; i < entries.size(); ++i) {
-        if (entries[i].url == url) {
-            return static_cast<int>(i);
-        }
-    }
-    return -1;
-}
-
-uint32_t clampResumeOffset(uint32_t offset, uint32_t size) {
-    if (size == 0) {
-        return offset;
-    }
-    if (offset >= size) {
-        return 0;
-    }
-    return offset;
-}
-
-uint32_t computeSeekTarget(bool forward) {
-    uint32_t size = currentPlaybackSize();
-    uint32_t pos = currentPlaybackPos();
-    uint32_t step = size > 0 ? std::max<uint32_t>(size / 20, SEEK_STEP_MIN_BYTES) : SEEK_STEP_MIN_BYTES;
-    if (forward) {
-        if (size > 0) {
-            return std::min(pos + step, size > 1 ? size - 1 : 0U);
-        }
-        return pos + step;
-    }
-    return pos > step ? pos - step : 0;
 }
 
 bool charInEvent(const KeyEvent &key, char wanted) {
@@ -623,143 +852,35 @@ int getWifiSignalBars() {
     return 0;
 }
 
-int getBatteryPercent() {
-    int level = M5Cardputer.Power.getBatteryLevel();
-    if (level < 0) {
-        return 0;
+void drawSignalGlyph(int x, int y, int bars, uint16_t active, uint16_t inactive) {
+    for (int i = 0; i < 4; ++i) {
+        int barH = 3 + i * 2;
+        M5Cardputer.Display.fillRect(x + i * 4, y + (9 - barH), 3, barH, i < bars ? active : inactive);
     }
-    if (level > 100) {
-        return 100;
-    }
-    return level;
-}
-
-bool isBatteryCharging() {
-    return M5Cardputer.Power.isCharging() == m5::Power_Class::is_charging_t::is_charging;
-}
-
-void syncClockIfNeeded() {
-    if (timeSyncRequested || WiFi.status() != WL_CONNECTED) {
-        return;
-    }
-    configTzTime("CST-8", "pool.ntp.org", "time.nist.gov", "time.google.com");
-    timeSyncRequested = true;
-}
-
-String headerClockText() {
-    struct tm timeinfo;
-    if (!getLocalTime(&timeinfo, 0)) {
-        return "--:--";
-    }
-    char buf[6];
-    snprintf(buf, sizeof(buf), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
-    return String(buf);
-}
-
-bool isAbnormalPlaybackReset(esp_reset_reason_t reason) {
-    switch (reason) {
-        case ESP_RST_PANIC:
-        case ESP_RST_INT_WDT:
-        case ESP_RST_TASK_WDT:
-        case ESP_RST_WDT:
-            return true;
-        default:
-            return false;
-    }
-}
-
-void wakePlayerDisplay() {
-    if (playerDimmed || playerScreenOff) {
-        M5Cardputer.Display.setBrightness(DISPLAY_BRIGHTNESS_ACTIVE);
-        playerDimmed = false;
-        playerScreenOff = false;
-        needsRedraw = true;
-    }
-}
-
-void markUserActivity() {
-    lastUserActionAt = millis();
-    wakePlayerDisplay();
-}
-
-KeyEvent readKeys() {
-    KeyEvent out;
-    if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) {
-        return out;
-    }
-
-    auto status = M5Cardputer.Keyboard.keysState();
-    out.pressed = true;
-    out.enter = status.enter;
-    out.del = status.del;
-    out.tab = status.tab;
-    out.fn = status.fn;
-
-    for (char c : status.word) {
-        if (c == ' ') {
-            out.space = true;
-        }
-        if (c >= 32 && c <= 126) {
-            out.chars.push_back(c);
-        }
-    }
-    return out;
 }
 
 void drawHeader(const String &title) {
-    M5Cardputer.Display.fillRect(0, 0, SCREEN_W, HEADER_H, C_BG);
-    M5Cardputer.Display.setTextColor(C_TEXT, C_BG);
-    M5Cardputer.Display.setCursor(8, 4);
-    M5Cardputer.Display.print(displayFit(title, 126));
-
+    auto &d = M5Cardputer.Display;
+    d.fillRect(0, 0, SCREEN_W, HEADER_H, C_BG);
+    d.setTextColor(C_TEXT, C_BG);
+    d.setCursor(8, 4);
+    d.print(displayFit(title, 150));
     bool wifiConnected = WiFi.status() == WL_CONNECTED;
-    int wifiBars = getWifiSignalBars();
-    int battery = getBatteryPercent();
-    bool charging = isBatteryCharging();
-    String clock = headerClockText();
-
-    M5Cardputer.Display.setTextColor(C_DIM, C_BG);
-    M5Cardputer.Display.setCursor(145, 4);
-    M5Cardputer.Display.print(clock);
-
     int wifiX = SCREEN_W - 50;
-    int wifiY = 4;
-    uint16_t wifiColor = wifiConnected ? C_TEXT : C_SOFT;
-    for (int i = 0; i < 4; ++i) {
-        int barH = 3 + i * 2;
-        int x = wifiX + i * 4;
-        int y = wifiY + (9 - barH);
-        M5Cardputer.Display.fillRect(x, y, 3, barH, i < wifiBars ? wifiColor : C_SOFT);
-    }
+    drawSignalGlyph(wifiX, 4, getWifiSignalBars(), wifiConnected ? C_TEXT : C_SOFT, C_SOFT);
     if (!wifiConnected) {
-        M5Cardputer.Display.drawLine(wifiX - 1, 14, wifiX + 14, 3, C_ERR);
+        d.drawLine(wifiX - 1, 14, wifiX + 14, 3, C_ERR);
     }
-
+    int battery = std::max(0, std::min(100, static_cast<int>(M5Cardputer.Power.getBatteryLevel())));
+    bool charging = M5Cardputer.Power.isCharging() == m5::Power_Class::is_charging_t::is_charging;
     int batX = SCREEN_W - 24;
-    int batY = 4;
-    int batW = 17;
-    int batH = 9;
-    M5Cardputer.Display.drawRoundRect(batX, batY, batW, batH, 2, C_DIM);
-    M5Cardputer.Display.fillRect(batX + batW, batY + 2, 2, batH - 4, C_DIM);
-    int fillW = ((batW - 3) * battery) / 100;
-    uint16_t batColor = battery > 25 ? (charging ? C_GOOD : C_DIM) : C_WARN;
-    if (battery <= 10) {
-        batColor = C_ERR;
-    }
+    d.drawRoundRect(batX, 4, 17, 9, 2, C_DIM);
+    d.fillRect(batX + 17, 6, 2, 5, C_DIM);
+    uint16_t batColor = battery <= 10 ? C_ERR : battery > 25 ? (charging ? C_GOOD : C_DIM) : C_WARN;
+    int fillW = (14 * battery) / 100;
     if (fillW > 0) {
-        M5Cardputer.Display.fillRect(batX + 2, batY + 2, fillW, batH - 3, batColor);
+        d.fillRect(batX + 2, 6, fillW, 6, batColor);
     }
-    if (charging) {
-        M5Cardputer.Display.drawLine(batX + 8, batY + 1, batX + 6, batY + 5, C_GOOD);
-        M5Cardputer.Display.drawLine(batX + 6, batY + 5, batX + 10, batY + 5, C_GOOD);
-        M5Cardputer.Display.drawLine(batX + 10, batY + 5, batX + 8, batY + 8, C_GOOD);
-    }
-
-    lastHeaderWifiBars = wifiBars;
-    lastHeaderWifiConnected = wifiConnected;
-    lastHeaderBattery = battery;
-    lastHeaderCharging = charging ? 1 : 0;
-    lastHeaderClockShown = clock;
 }
 
 void drawFooter(const String &text) {
@@ -781,39 +902,6 @@ void drawMeter(int x, int y, int w, int h, int fillW, uint16_t fillColor) {
     }
 }
 
-void drawSignalGlyph(int x, int y, int bars, uint16_t active, uint16_t inactive) {
-    for (int i = 0; i < 4; ++i) {
-        int barH = 3 + i * 2;
-        int barX = x + i * 4;
-        int barY = y + (9 - barH);
-        M5Cardputer.Display.fillRect(barX, barY, 3, barH, i < bars ? active : inactive);
-    }
-}
-
-void drawBrandMark(int x, int y, int size) {
-    M5Cardputer.Display.fillRoundRect(x, y, size, size, 9, C_ACCENT_DARK);
-    M5Cardputer.Display.fillRoundRect(x + 3, y + 3, size - 6, size - 6, 7, C_ACCENT);
-    M5Cardputer.Display.drawCircle(x + size / 2, y + size / 2, size / 3, C_TEXT);
-    M5Cardputer.Display.fillCircle(x + size / 2, y + size / 2, 3, C_ACCENT_DARK);
-    M5Cardputer.Display.drawFastVLine(x + size / 2 + size / 4, y + 5, size / 3, C_TEXT);
-}
-
-void drawSurface(int x, int y, int w, int h, uint16_t color = C_PANEL, int radius = 8) {
-    M5Cardputer.Display.fillRoundRect(x, y, w, h, radius, color);
-}
-
-void drawStatusBadge(int x, int y, int w, const String &label, uint16_t color, bool filled = false) {
-    uint16_t bg = filled ? color : C_PANEL;
-    M5Cardputer.Display.fillRoundRect(x, y, w, 14, 7, bg);
-    if (!filled) {
-        M5Cardputer.Display.drawRoundRect(x, y, w, 14, 7, color);
-    }
-    uint16_t fg = filled ? C_BG : color;
-    M5Cardputer.Display.setTextColor(fg, bg);
-    M5Cardputer.Display.setCursor(x + 7, y + 3);
-    M5Cardputer.Display.print(displayFit(label, w - 12));
-}
-
 void showMessage(const String &title, const String &body, uint32_t ms, Screen next) {
     messageTitle = title;
     messageBody = body;
@@ -826,53 +914,26 @@ void showMessage(const String &title, const String &body, uint32_t ms, Screen ne
 void drawBusyScreen(const String &title, const String &body) {
     M5Cardputer.Display.fillScreen(C_BG);
     drawHeader(title);
-    drawSurface(20, 31, 200, 70);
-    drawBrandMark(31, 45, 38);
+    M5Cardputer.Display.fillRoundRect(20, 40, 200, 50, 8, C_PANEL);
     M5Cardputer.Display.setTextColor(C_TEXT, C_PANEL);
-    M5Cardputer.Display.setCursor(82, 45);
-    M5Cardputer.Display.print(displayFit(body, 125));
+    M5Cardputer.Display.setCursor(32, 50);
+    M5Cardputer.Display.print(displayFit(body, 176));
     M5Cardputer.Display.setTextColor(C_DIM, C_PANEL);
-    M5Cardputer.Display.setCursor(82, 63);
+    M5Cardputer.Display.setCursor(32, 68);
     M5Cardputer.Display.print("Please wait");
-    for (int i = 0; i < 4; ++i) {
-        M5Cardputer.Display.fillCircle(85 + i * 11, 83, 2, i == 0 ? C_ACCENT : C_SOFT);
-    }
-}
-
-void prepareSingleTrackContext(const String &url) {
-    currentUrl = parentUrlOf(url);
-    entries.clear();
-    allEntries.clear();
-    selected = 0;
-    scrollTop = 0;
-    FileEntry entry;
-    entry.name = fileNameFromUrl(url);
-    entry.url = url;
-    entry.dir = false;
-    entries.push_back(entry);
-    allEntries = entries;
 }
 
 void drawMessage() {
     M5Cardputer.Display.fillScreen(C_BG);
     drawHeader(messageTitle);
-    drawSurface(20, 34, 200, 62);
-    M5Cardputer.Display.fillCircle(42, 65, 11, C_ACCENT);
-    M5Cardputer.Display.setTextColor(C_TEXT, C_ACCENT);
-    M5Cardputer.Display.setCursor(39, 59);
-    M5Cardputer.Display.print("i");
+    M5Cardputer.Display.fillRoundRect(20, 40, 200, 50, 8, C_PANEL);
     M5Cardputer.Display.setTextColor(C_TEXT, C_PANEL);
-    M5Cardputer.Display.setCursor(63, 49);
-    M5Cardputer.Display.print(displayFit(messageBody, 145));
-    M5Cardputer.Display.setTextColor(C_DIM, C_PANEL);
-    M5Cardputer.Display.setCursor(63, 69);
-    M5Cardputer.Display.print("Returning automatically");
+    M5Cardputer.Display.setCursor(32, 58);
+    M5Cardputer.Display.print(displayFit(messageBody, 176));
     needsRedraw = false;
 }
 
 void beginInput(InputMode mode, const String &title, const String &seed, bool secret) {
-    wakePlayerDisplay();
-    showHelpOverlay = false;
     inputMode = mode;
     inputTitle = title;
     inputText = seed;
@@ -882,650 +943,520 @@ void beginInput(InputMode mode, const String &title, const String &seed, bool se
 }
 
 void drawInput() {
-    M5Cardputer.Display.fillScreen(C_BG);
+    auto &d = M5Cardputer.Display;
+    d.fillScreen(C_BG);
     drawHeader(inputTitle);
     String shown = inputText;
     if (inputSecret) {
         shown = "";
-        for (int i = 0; i < inputText.length(); ++i) {
+        for (size_t i = 0; i < inputText.length(); ++i) {
             shown += '*';
         }
     }
-
-    drawSurface(8, 27, 224, 82);
-    M5Cardputer.Display.setTextColor(C_DIM, C_PANEL);
-    M5Cardputer.Display.setCursor(18, 35);
+    d.fillRoundRect(8, 27, 224, 82, 8, C_PANEL);
+    d.setTextColor(C_DIM, C_PANEL);
+    d.setCursor(18, 35);
     if (inputMode == InputMode::WifiPassword) {
-        M5Cardputer.Display.print(displayFit(pendingSsid, 204));
+        d.print(displayFit(pendingSsid, 204));
     } else if (inputMode == InputMode::NasUrl) {
-        M5Cardputer.Display.print("HTTP / WebDAV address");
-    } else if (inputMode == InputMode::FileSearch) {
-        M5Cardputer.Display.print("Search this folder");
+        d.print("HTTP / WebDAV address");
     } else {
-        M5Cardputer.Display.print("Network name");
+        d.print("Network name");
     }
-    M5Cardputer.Display.fillRoundRect(16, 52, 208, 27, 7, C_PANEL_ALT);
-    M5Cardputer.Display.drawRoundRect(16, 52, 208, 27, 7, C_ACCENT);
-    M5Cardputer.Display.setTextColor(C_TEXT, C_PANEL_ALT);
-    M5Cardputer.Display.setCursor(25, 60);
-    M5Cardputer.Display.print(tailFit(shown, 190));
-
-    M5Cardputer.Display.setTextColor(C_DIM, C_PANEL);
-    M5Cardputer.Display.setCursor(18, 89);
-    if (inputMode == InputMode::NasUrl) {
-        M5Cardputer.Display.print(displayFit("Example: http://nas:5005/music/", 204));
-    } else if (inputMode == InputMode::FileSearch) {
-        M5Cardputer.Display.print("Enter apply / Tab clear");
-    } else {
-        M5Cardputer.Display.print("Saved after connection");
-    }
+    d.fillRoundRect(16, 52, 208, 27, 7, C_PANEL_ALT);
+    d.drawRoundRect(16, 52, 208, 27, 7, C_ACCENT);
+    d.setTextColor(C_TEXT, C_PANEL_ALT);
+    d.setCursor(25, 60);
+    d.print(tailFit(shown, 190));
+    d.setTextColor(C_DIM, C_PANEL);
+    d.setCursor(18, 89);
+    d.print(inputMode == InputMode::NasUrl ? displayFit("Example: http://nas:5005/music/", 204) : String("Saved after connection"));
     drawFooter("Enter Done     Tab Back");
     needsRedraw = false;
 }
 
-class AudioOutputM5Speaker : public AudioOutput {
-public:
-    explicit AudioOutputM5Speaker(m5::Speaker_Class *speaker, uint8_t channel = 0)
-        : speaker_(speaker), channel_(channel) {
-    }
-
-    bool begin() override {
-        return true;
-    }
-
-    bool ConsumeSample(int16_t sample[2]) override {
-        if (bufPos_ + 1 >= BUF_SAMPLES) {
-            flush();
-            return false;
-        }
-        triBuf_[bufIndex_][bufPos_++] = sample[0];
-        triBuf_[bufIndex_][bufPos_++] = sample[1];
-        return true;
-    }
-
-    bool stop() override {
-        flush();
-        return true;
-    }
-
-    bool SetRate(int hz) override {
-        sampleRate_ = hz;
-        return true;
-    }
-
-    bool SetBitsPerSample(int bits) override {
-        return bits == 16;
-    }
-
-    bool SetChannels(int channels) override {
-        return channels == 2;
-    }
-
-    bool SetGain(float f) override {
-        gain_ = f;
-        return true;
-    }
-
-    void flush() override {
-        if (bufPos_ == 0) {
-            return;
-        }
-        speaker_->playRaw(triBuf_[bufIndex_], bufPos_, sampleRate_, true, 1, channel_);
-        bufIndex_ = (bufIndex_ + 1) % 3;
-        bufPos_ = 0;
-    }
-
-private:
-    static constexpr size_t BUF_SAMPLES = 1536;
-    m5::Speaker_Class *speaker_;
-    uint8_t channel_;
-    int16_t triBuf_[3][BUF_SAMPLES] = {};
-    size_t bufPos_ = 0;
-    uint8_t bufIndex_ = 0;
-    int sampleRate_ = 44100;
-    float gain_ = 1.0f;
-};
-
-AudioOutputM5Speaker out(&M5Cardputer.Speaker);
-
-class AudioFileSourceHTTPBasic : public AudioFileSource {
-public:
-    AudioFileSourceHTTPBasic() = default;
-    ~AudioFileSourceHTTPBasic() override {
-        close();
-    }
-
-    bool open(const char *filename) override {
-        return openAt(filename, 0);
-    }
-
-    bool openAt(const char *filename, uint32_t offset) {
-        close();
-        ParsedUrl parsed = parseUrl(String(filename));
-        if (!parsed.ok) {
-            return false;
-        }
-        requestUrl_ = filename;
-        cleanUrl_ = buildOrigin(parsed, false) + parsed.path;
-        client_.setTimeout(7000);
-        if (!http_.begin(client_, cleanUrl_)) {
-            return false;
-        }
-#ifdef HTTPC_FORCE_FOLLOW_REDIRECTS
-        http_.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-#endif
-        http_.setTimeout(12000);
-        http_.setReuse(false);
-        http_.useHTTP10(true);
-        http_.addHeader("User-Agent", "CardputerAdvMP3/1.0");
-        const char *headerKeys[] = {"Content-Range"};
-        http_.collectHeaders(headerKeys, 1);
-        if (!parsed.user.isEmpty()) {
-            http_.setAuthorization(parsed.user.c_str(), parsed.pass.c_str());
-        }
-        if (offset > 0) {
-            http_.addHeader("Range", "bytes=" + String(offset) + "-");
-        }
-        int code = http_.GET();
-        if (code != HTTP_CODE_OK && code != HTTP_CODE_PARTIAL_CONTENT) {
-            http_.end();
-            return false;
-        }
-        if (offset > 0 && code != HTTP_CODE_PARTIAL_CONTENT) {
-            http_.end();
-            return false;
-        }
-        stream_ = http_.getStreamPtr();
-        startOffset_ = code == HTTP_CODE_PARTIAL_CONTENT ? offset : 0;
-        size_ = http_.getSize();
-        if (code == HTTP_CODE_PARTIAL_CONTENT) {
-            String contentRange = http_.header("Content-Range");
-            int slash = contentRange.lastIndexOf('/');
-            if (slash >= 0) {
-                int total = contentRange.substring(slash + 1).toInt();
-                if (total > 0) {
-                    size_ = total;
-                } else if (size_ > 0) {
-                    size_ += static_cast<int>(startOffset_);
-                }
-            } else if (size_ > 0) {
-                size_ += static_cast<int>(startOffset_);
-            }
-        }
-        pos_ = startOffset_;
-        opened_ = true;
-        return true;
-    }
-
-    uint32_t read(void *data, uint32_t len) override {
-        return readInternal(data, len, false);
-    }
-
-    uint32_t readNonBlock(void *data, uint32_t len) override {
-        return readInternal(data, len, true);
-    }
-
-    bool seek(int32_t pos, int dir) override {
-        uint32_t target = 0;
-        if (dir == SEEK_CUR) {
-            int64_t candidate = static_cast<int64_t>(pos_) + pos;
-            if (candidate < 0) {
-                candidate = 0;
-            }
-            target = static_cast<uint32_t>(candidate);
-        } else if (dir == SEEK_END) {
-            if (size_ <= 0) {
-                return false;
-            }
-            int64_t candidate = static_cast<int64_t>(size_) + pos;
-            if (candidate < 0) {
-                candidate = 0;
-            }
-            target = static_cast<uint32_t>(candidate);
-        } else {
-            if (pos < 0) {
-                return false;
-            }
-            target = static_cast<uint32_t>(pos);
-        }
-        if (size_ > 0 && target >= static_cast<uint32_t>(size_)) {
-            target = static_cast<uint32_t>(size_ - 1);
-        }
-        if (requestUrl_.isEmpty()) {
-            return false;
-        }
-        return openAt(requestUrl_.c_str(), target);
-    }
-
-    bool close() override {
-        if (opened_) {
-            http_.end();
-        }
-        stream_ = nullptr;
-        opened_ = false;
-        size_ = -1;
-        pos_ = 0;
-        startOffset_ = 0;
-        return true;
-    }
-
-    bool isOpen() override {
-        return opened_;
-    }
-
-    uint32_t getSize() override {
-        return size_ > 0 ? static_cast<uint32_t>(size_) : 0;
-    }
-
-    uint32_t getPos() override {
-        return pos_;
-    }
-
-private:
-    uint32_t readInternal(void *data, uint32_t len, bool nonBlock) {
-        if (!opened_ || stream_ == nullptr || data == nullptr || len == 0) {
-            return 0;
-        }
-        if (size_ > 0 && pos_ >= static_cast<uint32_t>(size_)) {
-            return 0;
-        }
-        if (size_ > 0 && len > static_cast<uint32_t>(size_) - pos_) {
-            len = static_cast<uint32_t>(size_) - pos_;
-        }
-
-        uint32_t start = millis();
-        while (stream_->available() <= 0) {
-            if (!http_.connected()) {
-                return 0;
-            }
-            if (nonBlock || millis() - start > 1000) {
-                return 0;
-            }
-            delay(1);
-        }
-        int avail = stream_->available();
-        if (avail <= 0) {
-            return 0;
-        }
-        if (len > static_cast<uint32_t>(avail)) {
-            len = static_cast<uint32_t>(avail);
-        }
-        int got = stream_->readBytes(static_cast<uint8_t *>(data), len);
-        if (got > 0) {
-            pos_ += got;
-            return got;
-        }
-        return 0;
-    }
-
-    WiFiClient client_;
-    HTTPClient http_;
-    Client *stream_ = nullptr;
-    String requestUrl_;
-    String cleanUrl_;
-    int size_ = -1;
-    uint32_t pos_ = 0;
-    uint32_t startOffset_ = 0;
-    bool opened_ = false;
-};
-
-bool beginHttp(HTTPClient &http, WiFiClient &client, const String &url) {
-    ParsedUrl parsed = parseUrl(url);
-    if (!parsed.ok) {
-        return false;
-    }
-    client.setTimeout(10000);
-    String clean = buildOrigin(parsed, false) + parsed.path;
-    if (!http.begin(client, clean)) {
-        return false;
-    }
-#ifdef HTTPC_FORCE_FOLLOW_REDIRECTS
-    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-#endif
-    http.setTimeout(15000);
-    http.setReuse(false);
-    http.addHeader("User-Agent", "CardputerAdvMP3/1.0");
-    if (!parsed.user.isEmpty()) {
-        http.setAuthorization(parsed.user.c_str(), parsed.pass.c_str());
-    }
-    return true;
-}
-
-String readHttpBody(HTTPClient &http, size_t maxBytes) {
-    String body;
-    int total = http.getSize();
-    if (total > 0) {
-        body.reserve(std::min(static_cast<size_t>(total), maxBytes) + 1);
-    }
-    Client *stream = http.getStreamPtr();
-    if (!stream) {
-        return body;
-    }
-
-    char tmp[513];
-    uint32_t lastData = millis();
-    while (http.connected() && body.length() < maxBytes) {
-        size_t avail = stream->available();
-        if (avail > 0) {
-            size_t want = std::min(avail, sizeof(tmp) - 1);
-            want = std::min(want, maxBytes - static_cast<size_t>(body.length()));
-            int got = stream->readBytes(reinterpret_cast<uint8_t *>(tmp), want);
-            if (got > 0) {
-                tmp[got] = '\0';
-                body += tmp;
-                lastData = millis();
-            }
-        } else {
-            if (total >= 0 && body.length() >= total) {
-                break;
-            }
-            if (millis() - lastData > 12000) {
-                break;
-            }
-            delay(1);
-        }
-        yield();
-    }
-    return body;
-}
+// --------------------------------------------------------------------- WebDAV listing
 
 void addEntryIfUseful(const String &baseUrl, String href, bool forceDir) {
     href = xmlHtmlDecode(trimCopy(href));
-    while (href.startsWith("./")) {
-        href.remove(0, 2);
-    }
     if (href.isEmpty()) {
         return;
     }
-    String lowHref = toLowerCopy(href);
-    if (lowHref.startsWith("#") || lowHref.startsWith("?") || lowHref.startsWith("javascript:") ||
-        lowHref.startsWith("mailto:") || href == "../" || href == "..") {
-        return;
-    }
-
     String joined = joinUrl(baseUrl, href);
-    bool dir = forceDir || joined.endsWith("/");
-    bool mp3File = pathIsMp3(joined);
-    if (!dir && !mp3File) {
+    bool dir = forceDir || cleanUrlPath(joined).endsWith("/");
+    if (!dir && !pathIsMp3(joined)) {
         return;
     }
-    if (!isDirectChildUrl(baseUrl, joined, dir)) {
+    if (!isDirectChildUrl(baseUrl, joined, dir) || (dir && samePathUrl(joined, baseUrl))) {
         return;
     }
-    if (dir && samePathUrl(joined, baseUrl)) {
+    if (entries.size() >= MAX_ENTRIES || ESP.getFreeHeap() < MIN_FREE_HEAP_FOR_LIST) {
+        listTruncated = true;
         return;
     }
-    if (entries.size() >= MAX_ENTRIES) {
+    FileEntry entry;
+    entry.seg = lastSegment(joined);
+    entry.dir = dir;
+    if (entry.seg.isEmpty()) {
         return;
     }
-
-    for (const auto &entry : entries) {
-        if (entry.url == joined) {
+    for (const auto &e : entries) {
+        if (e.seg == entry.seg && e.dir == entry.dir) {
             return;
         }
-    }
-
-    FileEntry entry;
-    entry.url = dir ? ensureDirectoryUrl(joined) : joined;
-    entry.dir = dir;
-    entry.name = fileNameFromUrl(entry.url);
-    if (entry.name.isEmpty()) {
-        entry.name = dir ? "[folder]" : "[mp3]";
     }
     entries.push_back(entry);
 }
 
-void parseHtmlListing(const String &baseUrl, const String &body) {
-    String lower = toLowerCopy(body);
+// Text of the first opening <...href> tag of a <response> block (closing tags are skipped).
+bool extractResponseHref(const String &block, const String &lower, String &hrefOut) {
     int pos = 0;
-    while (pos >= 0 && entries.size() < MAX_ENTRIES) {
-        int href = lower.indexOf("href", pos);
-        if (href < 0) {
-            break;
-        }
-        int tagStart = lower.lastIndexOf('<', href);
-        int tagEnd = lower.indexOf('>', href);
-        if (tagStart < 0 || tagEnd < 0) {
-            break;
-        }
-        String tagName = lower.substring(tagStart + 1, href);
-        tagName.trim();
-        if (!(tagName == "a" || tagName.startsWith("a "))) {
-            pos = href + 4;
-            continue;
-        }
-        int eq = lower.indexOf('=', href + 4);
-        if (eq < 0 || eq > tagEnd) {
-            break;
-        }
-        int begin = eq + 1;
-        while (begin < body.length() && isspace(static_cast<unsigned char>(body[begin]))) {
-            ++begin;
-        }
-        if (begin >= body.length()) {
-            break;
-        }
-        char quote = body[begin];
-        int end = -1;
-        if (quote == '"' || quote == '\'') {
-            ++begin;
-            end = body.indexOf(quote, begin);
-        } else {
-            end = begin;
-            while (end < body.length() && !isspace(static_cast<unsigned char>(body[end])) && body[end] != '>') {
-                ++end;
-            }
-        }
-        if (end > begin) {
-            addEntryIfUseful(baseUrl, body.substring(begin, end), false);
-        }
-        pos = end > href ? end + 1 : href + 4;
-    }
-}
-
-String extractHrefTag(const String &body, const String &lower, int tagStart, int &tagEndOut) {
-    int gt = lower.indexOf('>', tagStart);
-    if (gt < 0) {
-        tagEndOut = tagStart + 1;
-        return "";
-    }
-    int close = lower.indexOf("</", gt + 1);
-    if (close < 0) {
-        tagEndOut = gt + 1;
-        return "";
-    }
-    tagEndOut = close + 2;
-    return body.substring(gt + 1, close);
-}
-
-void parseWebDavListing(const String &baseUrl, const String &body) {
-    String lower = toLowerCopy(body);
-    int pos = 0;
-    while (entries.size() < MAX_ENTRIES) {
+    while (true) {
         int tag = lower.indexOf("href", pos);
         if (tag < 0) {
-            break;
+            return false;
         }
+        pos = tag + 4;
         int lt = lower.lastIndexOf('<', tag);
         int gt = lower.indexOf('>', tag);
-        if (lt < 0 || gt < 0 || lt > tag) {
-            pos = tag + 4;
+        if (lt < 0 || gt < 0 || lower.indexOf('>', lt) < tag) {
+            continue;
+        }
+        if (lower[lt + 1] == '/' || lower[gt - 1] == '/') {
             continue;
         }
         String tagName = lower.substring(lt + 1, gt);
         tagName.trim();
-        if (!tagName.endsWith("href")) {
-            pos = tag + 4;
+        int space = tagName.indexOf(' ');
+        if (space >= 0) {
+            tagName.remove(space);
+        }
+        if (!(tagName == "href" || tagName.endsWith(":href"))) {
             continue;
         }
-        int afterHref = 0;
-        String href = extractHrefTag(body, lower, lt, afterHref);
-        int responseStart = -1;
-        int search = lt - 1;
-        while (search >= 0) {
-            int open = lower.lastIndexOf('<', search);
-            if (open < 0) {
-                break;
-            }
-            int close = lower.indexOf('>', open + 1);
-            if (close < 0 || close > lt) {
-                search = open - 1;
-                continue;
-            }
-            String tagName = lower.substring(open + 1, close);
-            tagName.trim();
-            int space = tagName.indexOf(' ');
-            if (space >= 0) {
-                tagName.remove(space);
-            }
-            if (!tagName.startsWith("/") && (tagName == "response" || tagName.endsWith(":response"))) {
-                responseStart = open;
-                break;
-            }
-            search = open - 1;
+        int close = lower.indexOf("</", gt + 1);
+        if (close < 0) {
+            return false;
         }
-
-        int responseEnd = -1;
-        if (responseStart >= 0) {
-            int nameStart = responseStart + 1;
-            int nameEnd = lower.indexOf('>', nameStart);
-            String responseName = lower.substring(nameStart, nameEnd);
-            int space = responseName.indexOf(' ');
-            if (space >= 0) {
-                responseName.remove(space);
-            }
-            responseEnd = lower.indexOf("</" + responseName, afterHref);
-        }
-        int blockEnd = responseEnd >= 0 ? responseEnd : std::min<int>(afterHref + 700, body.length());
-        int blockStart = responseStart >= 0 ? responseStart : lt;
-        String block = lower.substring(blockStart, blockEnd);
-        bool isDir = block.indexOf("collection") >= 0;
-        addEntryIfUseful(baseUrl, href, isDir);
-        pos = afterHref;
+        hrefOut = block.substring(gt + 1, close);
+        return true;
     }
 }
 
-void sortEntries() {
-    std::sort(entries.begin(), entries.end(), [](const FileEntry &a, const FileEntry &b) {
-        if (a.parent != b.parent) {
-            return a.parent;
+int findResponseEnd(const String &lower) {
+    int pos = 0;
+    while (true) {
+        int idx = lower.indexOf("response>", pos);
+        if (idx < 0) {
+            return -1;
         }
-        if (a.dir != b.dir) {
-            return a.dir && !b.dir;
+        int lt = lower.lastIndexOf('<', idx);
+        if (lt >= 0 && lt + 1 < static_cast<int>(lower.length()) && lower[lt + 1] == '/' &&
+            lower.indexOf('>', lt) == idx + 8) {
+            return idx + 9;
         }
-        String an = toLowerCopy(a.name);
-        String bn = toLowerCopy(b.name);
-        return an < bn;
-    });
+        pos = idx + 9;
+    }
 }
 
-bool fetchHttpListing(const String &url) {
-    WiFiClient client;
-    HTTPClient http;
-    if (!beginHttp(http, client, url)) {
-        return false;
+void parseWebDavStream(const String &baseUrl, HTTPClient &http) {
+    Client *stream = http.getStreamPtr();
+    if (!stream) {
+        return;
     }
-    int code = http.GET();
-    if (code == HTTP_CODE_OK) {
-        String body = readHttpBody(http, MAX_LIST_BODY);
-        parseHtmlListing(url, body);
-        http.end();
-        return !entries.empty();
+    String buf;
+    buf.reserve(4096);
+    char tmp[513];
+    uint32_t lastData = millis();
+    while (http.connected() || stream->available() > 0) {
+        size_t avail = stream->available();
+        if (avail == 0) {
+            if (millis() - lastData > 12000) {
+                break;
+            }
+            delay(1);
+            continue;
+        }
+        int got = stream->readBytes(reinterpret_cast<uint8_t *>(tmp), std::min(avail, sizeof(tmp) - 1));
+        if (got <= 0) {
+            continue;
+        }
+        tmp[got] = '\0';
+        buf += tmp;
+        lastData = millis();
+        while (true) {
+            String lower = toLowerCopy(buf);
+            int end = findResponseEnd(lower);
+            if (end < 0) {
+                break;
+            }
+            String block = buf.substring(0, end);
+            String blockLower = lower.substring(0, end);
+            String href;
+            if (extractResponseHref(block, blockLower, href)) {
+                addEntryIfUseful(baseUrl, href, blockLower.indexOf("collection") >= 0);
+            }
+            buf.remove(0, end);
+        }
+        if (buf.length() > 16384) {
+            buf.remove(0, buf.length() - 2048);
+        }
     }
-    http.end();
-    return false;
 }
 
 bool fetchWebDavListing(const String &url) {
+    ParsedUrl parsed = parseUrl(url);
+    if (!parsed.ok) {
+        return false;
+    }
     WiFiClient client;
     HTTPClient http;
-    if (!beginHttp(http, client, url)) {
+    client.setTimeout(10000);
+    if (!http.begin(client, buildOrigin(parsed, false) + parsed.path)) {
         return false;
+    }
+    http.setTimeout(15000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+    http.addHeader("User-Agent", "CardputerAdvMP3/2.0");
+    if (!parsed.user.isEmpty()) {
+        http.setAuthorization(parsed.user.c_str(), parsed.pass.c_str());
     }
     http.addHeader("Depth", "1");
     http.addHeader("Content-Type", "application/xml; charset=utf-8");
     const char *payload =
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
-        "<propfind xmlns=\"DAV:\">"
-        "<prop><displayname/><resourcetype/><getcontentlength/><getcontenttype/></prop>"
-        "</propfind>";
+        "<propfind xmlns=\"DAV:\"><prop><resourcetype/></prop></propfind>";
     int code = http.sendRequest("PROPFIND", reinterpret_cast<uint8_t *>(const_cast<char *>(payload)), strlen(payload));
-    if (code == 207 || code == HTTP_CODE_OK) {
-        String body = readHttpBody(http, MAX_LIST_BODY);
-        parseWebDavListing(url, body);
-        http.end();
-        return !entries.empty();
+    bool ok = code == 207 || code == HTTP_CODE_OK;
+    if (ok) {
+        parseWebDavStream(url, http);
     }
     http.end();
-    return false;
+    return ok;
 }
 
-void addParentEntry(const String &url) {
-    String parent = parentUrlOf(url);
-    if (parent == url || samePathUrl(parent, url)) {
-        return;
+void sortEntries() {
+    std::vector<String> keys;
+    keys.reserve(entries.size());
+    for (const auto &e : entries) {
+        keys.push_back(toLowerCopy(segToName(e.seg)));
     }
-    FileEntry up;
-    up.name = "[..]";
-    up.url = parent;
-    up.dir = true;
-    up.parent = true;
-    entries.push_back(up);
+    std::vector<size_t> order(entries.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        if (entries[a].parent != entries[b].parent) {
+            return entries[a].parent;
+        }
+        if (entries[a].dir != entries[b].dir) {
+            return entries[a].dir;
+        }
+        return naturalLess(keys[a], keys[b]);
+    });
+    std::vector<FileEntry> sorted;
+    sorted.reserve(entries.size());
+    for (size_t i : order) {
+        sorted.push_back(std::move(entries[i]));
+    }
+    entries = std::move(sorted);
+}
+
+String entryUrl(const FileEntry &e) {
+    if (e.parent) {
+        return parentUrlOf(currentUrl);
+    }
+    return currentUrl + segToUrlPart(e.seg) + (e.dir ? "/" : "");
 }
 
 bool loadDirectory(const String &rawUrl) {
-    String url = normalizeNasUrl(rawUrl);
-    currentUrl = url;
-    prefs.putString("nas", currentUrl);
+    String url = normalizeDirUrl(rawUrl);
+    entries.clear();
+    entries.shrink_to_fit();
+    listTruncated = false;
     selected = 0;
     scrollTop = 0;
-    fileSearchQuery = "";
-    allEntries.clear();
-    entries.clear();
-
-    if (pathIsMp3(url)) {
-        FileEntry one;
-        one.name = fileNameFromUrl(url);
-        one.url = url;
-        one.dir = false;
-        entries.push_back(one);
-        allEntries = entries;
-        return true;
+    String previous = currentUrl;
+    currentUrl = url;
+    if (!isRootUrl(url)) {
+        FileEntry up;
+        up.parent = true;
+        up.dir = true;
+        entries.push_back(up);
     }
-
-    addParentEntry(url);
-    bool ok = fetchWebDavListing(url);
-    if (!ok || entries.size() <= 1) {
-        entries.erase(std::remove_if(entries.begin(), entries.end(), [](const FileEntry &entry) {
-                          return !entry.parent;
-                      }),
-                      entries.end());
-        ok = fetchHttpListing(url);
+    if (!fetchWebDavListing(url)) {
+        currentUrl = previous;
+        return false;
     }
     sortEntries();
-    allEntries = entries;
-    applyFileSearch();
-    return !entries.empty();
+    prefs.putString("nas", currentUrl);
+    savedNas = currentUrl;
+    // If this is the folder being played, select the current track.
+    if (playIndex >= 0 && playlistDir == currentUrl) {
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (!entries[i].dir && entries[i].seg == playlist[playIndex]) {
+                selected = i;
+                break;
+            }
+        }
+    }
+    return true;
 }
 
-void drawWifiList() {
-    M5Cardputer.Display.fillScreen(C_BG);
-    drawHeader("Wi-Fi");
-    M5Cardputer.Display.setTextColor(C_DIM, C_BG);
-    M5Cardputer.Display.setCursor(9, 25);
-    M5Cardputer.Display.print(savedSsid.isEmpty() ? "Choose a network"
-                                                  : displayFit("Saved: " + savedSsid, 176));
-    M5Cardputer.Display.setCursor(198, 25);
-    M5Cardputer.Display.print(String(wifiItems.size()));
+// --------------------------------------------------------------------- playback
 
-    int visible = 4;
+void finishPlaylist(const String &why) {
+    stopTrack();
+    playIndex = -1;
+    playlist.clear();
+    playlistDir = "";
+    showMessage("Library", why, 1500, Screen::FileList);
+}
+
+bool startTrack(int index, bool showPlayer) {
+    stopTrack();
+    if (index < 0 || index >= static_cast<int>(playlist.size())) {
+        return false;
+    }
+    playIndex = index;
+    trackName = segToName(playlist[index]);
+    trackDurationMs = 0;
+    trackKbps = 0;
+    underruns.store(0);
+    if (showPlayer || screen == Screen::Player) {
+        drawBusyScreen("Now Playing", trackName);
+    }
+
+    if (!openStream(playlistDir + segToUrlPart(playlist[index]))) {
+        return false;
+    }
+    // ID3v2 tag (title, cover art...): skip it.
+    uint32_t audioStart = 0;
+    if (waitRing(10, 10000) && ringAvail() >= 10) {
+        uint8_t h[10];
+        ringPeek(h, 10);
+        if (h[0] == 'I' && h[1] == 'D' && h[2] == '3') {
+            uint32_t size = ((h[6] & 0x7F) << 21) | ((h[7] & 0x7F) << 14) | ((h[8] & 0x7F) << 7) | (h[9] & 0x7F);
+            size += 10 + ((h[5] & 0x10) ? 10 : 0);
+            audioStart = size;
+            uint32_t left = size;
+            uint32_t start = millis();
+            while (left > 0 && millis() - start < 30000) {
+                size_t n = std::min<size_t>(ringAvail(), left);
+                if (n == 0) {
+                    if (netEof.load()) {
+                        break;
+                    }
+                    delay(5);
+                    continue;
+                }
+                ringDiscard(n);
+                left -= n;
+            }
+        }
+    }
+    // Pre-fill the buffer before starting the sound.
+    waitRing(std::min<size_t>(ringCap * 3 / 4, 48 * 1024), 15000);
+    if (ringAvail() == 0) {
+        stopTrack();
+        return false;
+    }
+    {
+        size_t n = std::min<size_t>(ringAvail(), 4096);
+        uint8_t *peek = static_cast<uint8_t *>(malloc(n));
+        if (peek) {
+            ringPeek(peek, n);
+            uint32_t total = netTotal.load();
+            parseMp3Header(peek, n, total > audioStart ? total - audioStart : 0);
+            free(peek);
+        }
+    }
+    ringSource.reset(audioStart);
+    out.resetCounter();
+    xSemaphoreTake(decMutex, portMAX_DELAY);
+    mp3 = new AudioGeneratorMP3();
+    bool ok = mp3->begin(&ringSource, &out);
+    if (ok) {
+        playState.store(PS_PLAYING);
+    } else {
+        delete mp3;
+        mp3 = nullptr;
+    }
+    xSemaphoreGive(decMutex);
+    if (!ok) {
+        stopTrack();
+        return false;
+    }
+    Serial.printf("[play] %d/%d %s | %lu kbps, %lu ms, id3 %lu, size %lu | ring %u/%u | heap %u (max block %u)\n",
+                  index + 1, static_cast<int>(playlist.size()), trackName.c_str(),
+                  static_cast<unsigned long>(trackKbps), static_cast<unsigned long>(trackDurationMs),
+                  static_cast<unsigned long>(audioStart), static_cast<unsigned long>(netTotal.load()),
+                  static_cast<unsigned>(ringAvail()), static_cast<unsigned>(ringCap), ESP.getFreeHeap(),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    if (showPlayer) {
+        screen = Screen::Player;
+    }
+    needsRedraw = true;  // keep the list on screen if the user is browsing
+    return true;
+}
+
+// Plays track `index`; if a file cannot be played, moves on to the next one.
+void playFrom(int index, bool showPlayer) {
+    while (index >= 0 && index < static_cast<int>(playlist.size())) {
+        if (startTrack(index, showPlayer)) {
+            failedInRow = 0;
+            return;
+        }
+        if (WiFi.status() != WL_CONNECTED || ++failedInRow >= 3) {
+            failedInRow = 0;
+            finishPlaylist("Cannot play files");
+            return;
+        }
+        ++index;
+    }
+    finishPlaylist("End of folder");
+}
+
+void playFolderFrom(int entryIndex) {
+    playlist.clear();
+    playlistDir = currentUrl;
+    int start = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (!entries[i].dir) {
+            if (static_cast<int>(i) == entryIndex) {
+                start = playlist.size();
+            }
+            playlist.push_back(entries[i].seg);
+        }
+    }
+    playFrom(start, true);
+}
+
+void togglePause() {
+    int st = playState.load();
+    if (st == PS_PLAYING) {
+        playState.store(PS_PAUSED);
+    } else if (st == PS_PAUSED) {
+        playState.store(PS_PLAYING);
+    }
+    needsRedraw = true;
+}
+
+void drawPlayerDynamic() {
+    auto &d = M5Cardputer.Display;
+    uint32_t elapsed = out.elapsedMs();
+    String timeText = formatTime(elapsed) + " / " + (trackDurationMs > 0 ? formatTime(trackDurationMs) : String("--:--"));
+    if (trackKbps > 0) {
+        timeText += "   " + String(trackKbps) + " kbps";
+    }
+    d.fillRect(8, 62, 224, 12, C_BG);
+    d.setTextColor(C_TEXT, C_BG);
+    d.setCursor(8, 62);
+    d.print(timeText);
+    int fill = trackDurationMs > 0 ? static_cast<int>(static_cast<uint64_t>(224) * std::min(elapsed, trackDurationMs) / trackDurationMs) : 0;
+    drawMeter(8, 77, 224, 4, fill, C_ACCENT);
+
+    size_t avail = ringAvail();
+    int pct = ringCap > 0 ? static_cast<int>(avail * 100 / ringCap) : 0;
+    uint32_t cuts = underruns.load();
+    String bufText = "Buffer " + String(pct) + "% of " + String(ringCap / 1024) + "K";
+    if (cuts > 0) {
+        bufText += "  cuts " + String(cuts);
+    }
+    if (playState.load() == PS_PAUSED) {
+        bufText += "  PAUSE";
+    }
+    d.fillRect(8, 86, 224, 12, C_BG);
+    d.setTextColor(cuts > 0 ? C_WARN : C_DIM, C_BG);
+    d.setCursor(8, 86);
+    d.print(bufText);
+
+    d.fillRect(8, 101, 224, 12, C_BG);
+    d.setTextColor(C_DIM, C_BG);
+    d.setCursor(8, 101);
+    d.print("Vol " + String(volume * 100 / 255) + "%");
+    drawMeter(70, 105, 100, 4, volume * 100 / 255, C_SELECT);
+}
+
+void drawPlayer() {
+    auto &d = M5Cardputer.Display;
+    d.fillScreen(C_BG);
+    drawHeader("Now Playing");
+    d.setTextColor(C_TEXT, C_BG);
+    d.setCursor(8, 26);
+    d.print(displayFit(trackName, 224));
+    d.setTextColor(C_DIM, C_BG);
+    d.setCursor(8, 43);
+    d.print(displayFit(String(playIndex + 1) + "/" + String(playlist.size()) + "  " + segToName(lastSegment(playlistDir)), 224));
+    drawPlayerDynamic();
+    drawFooter("Space Pause  N/P Track  ` Library");
+    needsRedraw = false;
+}
+
+void drawFileList() {
+    auto &d = M5Cardputer.Display;
+    d.fillScreen(C_BG);
+    drawHeader("Library");
+    String location = isRootUrl(currentUrl) ? String("/") : segToName(lastSegment(currentUrl));
+    d.setTextColor(C_DIM, C_BG);
+    d.setCursor(9, 24);
+    d.print(displayFit(location, 180));
+    String count = String(entries.size()) + (listTruncated ? "+" : "");
+    d.setCursor(SCREEN_W - 8 - d.textWidth(count), 24);
+    d.print(count);
+
+    const int listTop = 38;
+    const int visible = 6;
+    if (selected < scrollTop) {
+        scrollTop = selected;
+    }
+    if (selected >= scrollTop + visible) {
+        scrollTop = selected - visible + 1;
+    }
+    bool playingHere = playIndex >= 0 && playlistDir == currentUrl;
+    for (int row = 0; row < visible; ++row) {
+        int idx = scrollTop + row;
+        if (idx >= static_cast<int>(entries.size())) {
+            break;
+        }
+        const FileEntry &e = entries[idx];
+        int y = listTop + row * 13;
+        bool sel = idx == selected;
+        bool playing = playingHere && !e.dir && e.seg == playlist[playIndex];
+        uint16_t rowBg = sel ? C_SELECT : C_PANEL;
+        d.fillRoundRect(8, y, 224, 12, 5, rowBg);
+        uint16_t fg = sel ? C_TEXT : (playing ? C_GOOD : (e.dir ? C_ACCENT : C_TEXT));
+        d.setTextColor(fg, rowBg);
+        d.setCursor(16, y + 2);
+        String label = e.parent ? String("[..]") : String(playing ? "> " : "") + segToName(e.seg);
+        d.print(displayFit(label, 205));
+    }
+    if (entries.empty()) {
+        d.setTextColor(C_WARN, C_BG);
+        d.setCursor(60, 70);
+        d.print("No folder / MP3 here");
+    }
+    drawFooter(playIndex >= 0 ? "Enter Open  ` Back  Tab Player" : "Enter Open  ` Back  N Address");
+    needsRedraw = false;
+}
+
+// --------------------------------------------------------------------- Wi-Fi
+
+void drawWifiList() {
+    auto &d = M5Cardputer.Display;
+    d.fillScreen(C_BG);
+    drawHeader("Wi-Fi");
+    d.setTextColor(C_DIM, C_BG);
+    d.setCursor(9, 25);
+    d.print(savedSsid.isEmpty() ? String("Choose a network") : displayFit("Saved: " + savedSsid, 176));
+    const int visible = 4;
     if (wifiSelected < wifiScrollTop) {
         wifiScrollTop = wifiSelected;
     }
     if (wifiSelected >= wifiScrollTop + visible) {
         wifiScrollTop = wifiSelected - visible + 1;
     }
-
     for (int row = 0; row < visible; ++row) {
         int idx = wifiScrollTop + row;
         if (idx >= static_cast<int>(wifiItems.size())) {
@@ -1534,53 +1465,27 @@ void drawWifiList() {
         int y = 40 + row * 19;
         bool sel = idx == wifiSelected;
         uint16_t rowBg = sel ? C_SELECT : C_PANEL;
-        M5Cardputer.Display.fillRoundRect(8, y, 224, 17, 7, rowBg);
-        uint16_t fg = sel ? C_TEXT : C_TEXT;
-        String label;
-        if (wifiItems[idx].manual) {
-            label = "Manual SSID";
-        } else if (wifiItems[idx].saved) {
-            label = wifiItems[idx].ssid;
-        } else {
-            label = wifiItems[idx].ssid;
-        }
-        M5Cardputer.Display.setTextColor(fg, rowBg);
-        M5Cardputer.Display.setCursor(17, y + 4);
-        M5Cardputer.Display.print(displayFit(label, 150));
-        if (wifiItems[idx].manual) {
-            M5Cardputer.Display.setTextColor(sel ? C_TEXT : C_DIM, rowBg);
-            M5Cardputer.Display.setCursor(186, y + 4);
-            M5Cardputer.Display.print("Manual");
-        } else if (wifiItems[idx].saved) {
-            M5Cardputer.Display.fillCircle(209, y + 8, 3, sel ? C_TEXT : C_GOOD);
-        } else {
-            int bars = wifiItems[idx].rssi >= -55 ? 4 : wifiItems[idx].rssi >= -67 ? 3
-                      : wifiItems[idx].rssi >= -75 ? 2
-                      : wifiItems[idx].rssi >= -85 ? 1
-                                                  : 0;
+        d.fillRoundRect(8, y, 224, 17, 7, rowBg);
+        d.setTextColor(C_TEXT, rowBg);
+        d.setCursor(17, y + 4);
+        d.print(displayFit(wifiItems[idx].manual ? String("Manual SSID") : wifiItems[idx].ssid, 150));
+        if (wifiItems[idx].saved) {
+            d.fillCircle(209, y + 8, 3, sel ? C_TEXT : C_GOOD);
+        } else if (!wifiItems[idx].manual) {
+            int r = wifiItems[idx].rssi;
+            int bars = r >= -55 ? 4 : r >= -67 ? 3 : r >= -75 ? 2 : r >= -85 ? 1 : 0;
             drawSignalGlyph(201, y + 4, bars, sel ? C_TEXT : C_DIM, sel ? C_ACCENT_DARK : C_TRACK);
         }
     }
-    drawFooter("Enter Connect     Tab Back");
+    drawFooter("Enter Connect  R Rescan  ` Back");
     needsRedraw = false;
 }
 
 void scanWifi() {
-    wakePlayerDisplay();
-    M5Cardputer.Display.fillScreen(C_BG);
-    drawHeader("Wi-Fi");
-    drawSurface(31, 37, 178, 58);
-    drawSignalGlyph(48, 54, 4, C_ACCENT, C_SOFT);
-    M5Cardputer.Display.setTextColor(C_TEXT, C_PANEL);
-    M5Cardputer.Display.setCursor(80, 51);
-    M5Cardputer.Display.print("Searching for networks");
-    M5Cardputer.Display.setTextColor(C_DIM, C_PANEL);
-    M5Cardputer.Display.setCursor(80, 70);
-    M5Cardputer.Display.print("Please wait");
+    drawBusyScreen("Wi-Fi", "Searching for networks");
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, false);
     delay(100);
-
     wifiItems.clear();
     if (!savedSsid.isEmpty()) {
         WifiItem item;
@@ -1589,7 +1494,6 @@ void scanWifi() {
         item.enc = WIFI_AUTH_WPA2_PSK;
         wifiItems.push_back(item);
     }
-
     int count = WiFi.scanNetworks(false, true);
     for (int i = 0; i < count; ++i) {
         String ssid = WiFi.SSID(i);
@@ -1598,7 +1502,7 @@ void scanWifi() {
         }
         bool exists = false;
         for (const auto &item : wifiItems) {
-            if (item.ssid == ssid && !item.manual) {
+            if (item.ssid == ssid) {
                 exists = true;
                 break;
             }
@@ -1612,19 +1516,15 @@ void scanWifi() {
         item.enc = WiFi.encryptionType(i);
         wifiItems.push_back(item);
     }
+    WiFi.scanDelete();
     std::sort(wifiItems.begin(), wifiItems.end(), [](const WifiItem &a, const WifiItem &b) {
         if (a.saved != b.saved) {
             return a.saved;
         }
-        if (a.manual != b.manual) {
-            return !a.manual;
-        }
         return a.rssi > b.rssi;
     });
-
     WifiItem manual;
     manual.manual = true;
-    manual.ssid = "Manual SSID";
     wifiItems.push_back(manual);
     wifiSelected = 0;
     wifiScrollTop = 0;
@@ -1632,503 +1532,100 @@ void scanWifi() {
     needsRedraw = true;
 }
 
-void afterWifiConnected() {
-    savedSsid = pendingSsid;
-    savedPass = inputText;
-    prefs.putString("ssid", savedSsid);
-    prefs.putString("pass", savedPass);
-    beginInput(InputMode::NasUrl, "NAS address", savedNas.isEmpty() ? "http://" : savedNas, false);
-}
-
 bool connectWifi(const String &ssid, const String &pass) {
-    wakePlayerDisplay();
-    M5Cardputer.Display.fillScreen(C_BG);
-    drawHeader("Wi-Fi");
-    drawSurface(24, 32, 192, 72);
-    M5Cardputer.Display.setTextColor(C_DIM, C_PANEL);
-    M5Cardputer.Display.setCursor(38, 43);
-    M5Cardputer.Display.print("Connecting to");
-    M5Cardputer.Display.setTextColor(C_TEXT, C_PANEL);
-    M5Cardputer.Display.setCursor(38, 61);
-    M5Cardputer.Display.print(displayFit(ssid, 164));
+    drawBusyScreen("Wi-Fi", "Connecting to " + ssid);
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
     WiFi.begin(ssid.c_str(), pass.c_str());
-
     uint32_t start = millis();
-    int dots = 0;
     while (WiFi.status() != WL_CONNECTED && millis() - start < 22000) {
         M5Cardputer.update();
-        if ((millis() / 350) % 4 != dots) {
-            dots = (millis() / 350) % 4;
-            M5Cardputer.Display.fillRect(38, 81, 80, 10, C_PANEL);
-            M5Cardputer.Display.setTextColor(C_ACCENT, C_PANEL);
-            M5Cardputer.Display.setCursor(38, 81);
-            for (int i = 0; i < dots; ++i) {
-                M5Cardputer.Display.print(".");
-            }
-        }
         delay(20);
     }
-
     if (WiFi.status() == WL_CONNECTED) {
-        syncClockIfNeeded();
-        M5Cardputer.Display.setTextColor(C_GOOD, C_PANEL);
-        M5Cardputer.Display.setCursor(128, 81);
-        M5Cardputer.Display.print(WiFi.localIP().toString());
-        delay(600);
+        WiFi.setSleep(false);  // no Wi-Fi power saving: steadier throughput
         return true;
     }
     WiFi.disconnect(false, false);
     return false;
 }
 
-bool tryAutoStart() {
-    if (savedSsid.isEmpty()) {
-        return false;
-    }
-    if (isAbnormalPlaybackReset(bootResetReason)) {
-        clearResumeState();
-        currentTrackUrl = "";
-        currentTrackName = "";
-        return false;
-    }
-    pendingSsid = savedSsid;
-    inputText = savedPass;
-    if (!connectWifi(savedSsid, savedPass)) {
-        return false;
-    }
-
-    if (!savedResumeUrl.isEmpty()) {
-        drawBusyScreen("NAS", "Resuming track...");
-        prepareSingleTrackContext(savedResumeUrl);
-        currentTrackName = entries[0].name;
-        currentTrackUrl = savedResumeUrl;
-        screen = Screen::Player;
-        needsRedraw = true;
-        return true;
-    }
-
-    drawBusyScreen("NAS", "Loading files...");
-    if (!savedNas.isEmpty() && loadDirectory(savedNas)) {
-        screen = Screen::FileList;
-        needsRedraw = true;
-        return true;
-    }
-
-    beginInput(InputMode::NasUrl, "NAS address", savedNas.isEmpty() ? "http://" : savedNas, false);
-    return true;
-}
-
-void applyFileSearch() {
-    selected = 0;
-    scrollTop = 0;
-    if (fileSearchQuery.isEmpty()) {
-        entries = allEntries;
-        return;
-    }
-
-    entries.clear();
-    for (const auto &entry : allEntries) {
-        if (entry.parent || containsIgnoreCase(entry.name, fileSearchQuery)) {
-            entries.push_back(entry);
+void openSavedLibrary() {
+    if (!savedNas.isEmpty()) {
+        drawBusyScreen("Library", "Loading files");
+        if (loadDirectory(savedNas)) {
+            screen = Screen::FileList;
+            needsRedraw = true;
+            return;
         }
     }
+    beginInput(InputMode::NasUrl, "NAS address", savedNas.isEmpty() ? String("http://") : savedNas, false);
 }
 
-void drawFileList() {
-    wakePlayerDisplay();
-    M5Cardputer.Display.fillScreen(C_BG);
-    drawHeader("Library");
-    String location = currentUrl.isEmpty() ? "NAS ROOT" : fileNameFromUrl(currentUrl);
-    M5Cardputer.Display.setTextColor(C_DIM, C_BG);
-    M5Cardputer.Display.setCursor(9, 25);
-    String subtitle = fileSearchQuery.isEmpty() ? location : ("Search: " + fileSearchQuery);
-    M5Cardputer.Display.print(displayFit(subtitle, 176));
-    M5Cardputer.Display.setCursor(205, 25);
-    M5Cardputer.Display.print(String(entries.size()));
+void afterWifiConnected() {
+    savedSsid = pendingSsid;
+    savedPass = inputText;
+    prefs.putString("ssid", savedSsid);
+    prefs.putString("pass", savedPass);
+    openSavedLibrary();
+}
 
-    int listTop = 40;
-    int visible = 6;
-    if (selected < scrollTop) {
-        scrollTop = selected;
-    }
-    if (selected >= scrollTop + visible) {
-        scrollTop = selected - visible + 1;
-    }
+// --------------------------------------------------------------------- keyboard
 
-    for (int row = 0; row < visible; ++row) {
-        int idx = scrollTop + row;
-        if (idx >= static_cast<int>(entries.size())) {
-            break;
+KeyEvent readKeys() {
+    KeyEvent out;
+    static char heldNav = 0;
+    static uint32_t nextRepeat = 0;
+    auto &kb = M5Cardputer.Keyboard;
+    if (kb.isChange() && kb.isPressed()) {
+        auto status = kb.keysState();
+        out.pressed = true;
+        out.enter = status.enter;
+        out.del = status.del;
+        out.tab = status.tab;
+        out.fn = status.fn;
+        heldNav = 0;
+        for (char c : status.word) {
+            if (c == ' ') {
+                out.space = true;
+            }
+            if (c >= 32 && c <= 126) {
+                out.chars.push_back(c);
+            }
+            if (c == ';' || c == '.' || c == 'w' || c == 's') {
+                heldNav = c;
+            }
         }
-        int y = listTop + row * 13;
-        bool sel = idx == selected;
-        uint16_t rowBg = sel ? C_SELECT : C_PANEL;
-        M5Cardputer.Display.fillRoundRect(8, y, 224, 12, 5, rowBg);
-        uint16_t fg = sel ? C_TEXT : (entries[idx].dir ? C_ACCENT : C_TEXT);
-        M5Cardputer.Display.setTextColor(fg, rowBg);
-        M5Cardputer.Display.setCursor(16, y + 2);
-        String label = entries[idx].parent ? "Back" : entries[idx].name;
-        M5Cardputer.Display.print(displayFit(label, 205));
+        nextRepeat = millis() + 400;
+        return out;
     }
-
-    if (entries.empty()) {
-        M5Cardputer.Display.setTextColor(C_WARN, C_BG);
-        M5Cardputer.Display.setCursor(68, 70);
-        M5Cardputer.Display.print("No matching audio");
+    // Navigation key held down: auto-repeat (long lists).
+    if (heldNav != 0 && kb.isPressed() && millis() >= nextRepeat &&
+        (screen == Screen::FileList || screen == Screen::WifiList)) {
+        nextRepeat = millis() + 60;
+        out.pressed = true;
+        out.chars.push_back(heldNav);
+        return out;
     }
-
-    drawFooter("Enter Open     H More");
-    needsRedraw = false;
+    if (!kb.isPressed()) {
+        heldNav = 0;
+    }
+    return out;
 }
 
-int nextPlayableIndex(int from, int dir) {
-    if (entries.empty()) {
-        return -1;
-    }
-    int idx = from;
-    for (size_t step = 0; step < entries.size(); ++step) {
-        idx += dir;
-        if (idx < 0) {
-            idx = entries.size() - 1;
-        }
-        if (idx >= static_cast<int>(entries.size())) {
-            idx = 0;
-        }
-        if (!entries[idx].dir && pathIsMp3(entries[idx].url)) {
-            return idx;
-        }
-    }
-    return -1;
+bool isUp(const KeyEvent &k) {
+    return charInEvent(k, ';') || charInEvent(k, 'w');
 }
 
-bool ensurePlaybackFolderLoaded(const String &failNextScreenText) {
-    if (entries.size() > 1) {
-        return true;
-    }
-    if (currentUrl.isEmpty()) {
-        return false;
-    }
-    drawBusyScreen("NAS", "Loading files...");
-    if (!loadDirectory(currentUrl)) {
-        showMessage("NAS failed", failNextScreenText, 1400, Screen::FileList);
-        return false;
-    }
-    int currentIndex = findEntryIndexByUrl(currentTrackUrl);
-    if (currentIndex >= 0) {
-        selected = currentIndex;
-    }
-    return true;
+bool isDown(const KeyEvent &k) {
+    return charInEvent(k, '.') || charInEvent(k, 's');
 }
 
-void stopPlayback(bool keepResume) {
-    wakePlayerDisplay();
-    if (keepResume) {
-        persistPlaybackState(true);
-    }
-    playbackStartedAt = 0;
-    skipPlaybackLoopOnce = false;
-    if (mp3) {
-        mp3->stop();
-        delete mp3;
-        mp3 = nullptr;
-    }
-    if (id3Source) {
-        delete id3Source;
-        id3Source = nullptr;
-    }
-    if (buffSource) {
-        delete buffSource;
-        buffSource = nullptr;
-    }
-    if (httpSource) {
-        delete httpSource;
-        httpSource = nullptr;
-    }
-    out.flush();
-    M5Cardputer.Speaker.stop();
-}
-
-void startPlayback(int index, uint32_t offset, bool fallbackToZero) {
-    if (index < 0 || index >= static_cast<int>(entries.size()) || entries[index].dir) {
-        return;
-    }
-    stopPlayback(false);
-    selected = index;
-    currentTrackName = entries[index].name;
-    currentTrackUrl = entries[index].url;
-    httpSource = new AudioFileSourceHTTPBasic();
-    AudioFileSourceHTTPBasic *basicSource = static_cast<AudioFileSourceHTTPBasic *>(httpSource);
-    bool opened = basicSource->openAt(entries[index].url.c_str(), offset);
-    if (!opened && offset > 0 && fallbackToZero) {
-        opened = basicSource->open(entries[index].url.c_str());
-        offset = 0;
-    }
-    if (!opened) {
-        delete httpSource;
-        httpSource = nullptr;
-        currentTrackUrl = "";
-        if (fallbackToZero) {
-            showMessage("Audio error", "Cannot open stream", 1400, Screen::FileList);
-        }
-        return;
-    }
-    buffSource = new AudioFileSourceBuffer(httpSource, 8192);
-    id3Source = new AudioFileSourceID3(buffSource);
-    mp3 = new AudioGeneratorMP3();
-    M5Cardputer.Speaker.setVolume(volume);
-    out.SetGain(1.0f);
-    if (!mp3->begin(id3Source, &out)) {
-        stopPlayback(false);
-        currentTrackUrl = "";
-        if (fallbackToZero) {
-            showMessage("Audio error", "MP3 decoder failed", 1400, Screen::FileList);
-        }
-        return;
-    }
-    saveResumeState(currentTrackUrl, clampResumeOffset(offset, currentPlaybackSize()));
-    lastResumeSaveAt = millis();
-    playbackStartedAt = millis();
-    lastUserActionAt = millis();
-    skipPlaybackLoopOnce = true;
-    wakePlayerDisplay();
-    screen = Screen::Player;
-    needsRedraw = true;
-}
-
-String timerRemainingText() {
-    if (shutdownAt == 0) {
-        return "";
-    }
-    int32_t left = static_cast<int32_t>(shutdownAt - millis());
-    if (left <= 0) {
-        return "NOW";
-    }
-    uint32_t minutes = (static_cast<uint32_t>(left) + 59999UL) / 60000UL;
-    return String(minutes) + "M";
-}
-
-void drawPlayer() {
-    M5Cardputer.Display.fillScreen(C_BG);
-    drawHeader("Now Playing");
-    drawBrandMark(10, 27, 42);
-    M5Cardputer.Display.setTextColor(C_TEXT, C_BG);
-    M5Cardputer.Display.setCursor(62, 29);
-    M5Cardputer.Display.print(displayFit(currentTrackName, 166));
-    M5Cardputer.Display.setTextColor(C_DIM, C_BG);
-    M5Cardputer.Display.setCursor(62, 47);
-    M5Cardputer.Display.print("NAS Audio");
-
-    M5Cardputer.Display.setTextColor(C_DIM, C_BG);
-    M5Cardputer.Display.setCursor(10, 105);
-    M5Cardputer.Display.print("Volume");
-
-    drawFooter("Space Play/Pause     H More");
-
-    lastPlayerPosShown = UINT32_MAX;
-    lastPlayerSizeShown = UINT32_MAX;
-    lastPlayerVolumeShown = -1;
-    lastPlayerTimerShown = "";
-    lastPlayerStateShown = "";
-    drawPlayerDynamic(true);
-    needsRedraw = false;
-    lastPlayerRedraw = millis();
-}
-
-void drawPlayerDynamic(bool force) {
-    if (showHelpOverlay) {
-        return;
-    }
-    uint32_t pos = currentPlaybackPos();
-    uint32_t size = currentPlaybackSize();
-    String timer = timerRemainingText();
-    String stateText = mp3 && mp3->isRunning() ? "PLAY" : (currentTrackUrl.isEmpty() ? "STOP" : "READY");
-    String progressText;
-    String progressPct = "--";
-    if (size > 0) {
-        uint32_t posSec = pos / 16000UL;
-        uint32_t sizeSec = size / 16000UL;
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%02lu:%02lu/%02lu:%02lu",
-                 static_cast<unsigned long>(posSec / 60), static_cast<unsigned long>(posSec % 60),
-                 static_cast<unsigned long>(sizeSec / 60), static_cast<unsigned long>(sizeSec % 60));
-        progressText = String(buf);
-        progressPct = String((pos * 100UL) / size) + "%";
-    } else {
-        progressText = "LIVE STREAM";
-    }
-
-    if (force || pos != lastPlayerPosShown || size != lastPlayerSizeShown) {
-        drawMeter(62, 91, 166, 4, 0, C_ACCENT);
-        if (size > 0) {
-            int fill = static_cast<int>((static_cast<uint64_t>(166) * pos) / size);
-            drawMeter(62, 91, 166, 4, fill, C_ACCENT);
-        }
-        M5Cardputer.Display.fillRect(62, 78, 130, 9, C_BG);
-        M5Cardputer.Display.setTextColor(C_DIM, C_BG);
-        M5Cardputer.Display.setCursor(62, 78);
-        M5Cardputer.Display.print(displayFit(progressText, 128));
-        M5Cardputer.Display.fillRect(199, 78, 29, 9, C_BG);
-        M5Cardputer.Display.setTextColor(C_TEXT, C_BG);
-        M5Cardputer.Display.setCursor(199, 78);
-        M5Cardputer.Display.print(displayFit(progressPct, 29));
-        lastPlayerPosShown = pos;
-        lastPlayerSizeShown = size;
-    }
-
-    if (force || volume != lastPlayerVolumeShown) {
-        int volFill = (120 * volume) / 255;
-        drawMeter(62, 109, 120, 4, volFill, C_SELECT);
-        M5Cardputer.Display.fillRect(194, 105, 34, 9, C_BG);
-        M5Cardputer.Display.setTextColor(C_TEXT, C_BG);
-        M5Cardputer.Display.setCursor(194, 105);
-        M5Cardputer.Display.print(String((volume * 100) / 255) + "%");
-        lastPlayerVolumeShown = volume;
-    }
-
-    if (force || stateText != lastPlayerStateShown) {
-        M5Cardputer.Display.fillRect(8, 75, 46, 18, C_BG);
-        uint16_t stateColor = stateText == "PLAY" ? C_GOOD : (stateText == "READY" ? C_ACCENT : C_WARN);
-        drawStatusBadge(9, 77, 44, stateText, stateColor, true);
-        lastPlayerStateShown = stateText;
-    }
-
-    if (force || timer != lastPlayerTimerShown) {
-        bool timerEnabled = shutdownAt != 0;
-        uint16_t timerColor = timerEnabled ? C_GOOD : C_WARN;
-        M5Cardputer.Display.fillRect(111, 61, 117, 15, C_BG);
-        drawStatusBadge(111, 61, 58, "TIMER", timerColor);
-        if (timerEnabled) {
-            M5Cardputer.Display.setTextColor(C_GOOD, C_BG);
-            M5Cardputer.Display.setCursor(181, 64);
-            M5Cardputer.Display.print(displayFit(timer, 38));
-        }
-        lastPlayerTimerShown = timer;
-    }
-
-    static int lastEcoShown = -1;
-    int ecoState = powerSaveEnabled ? (playerDimmed ? 2 : 1) : 0;
-    if (force || ecoState != lastEcoShown) {
-        uint16_t ecoColor = ecoState == 2 ? C_WARN : (ecoState == 1 ? C_GOOD : C_DIM);
-        M5Cardputer.Display.fillRect(62, 61, 44, 14, C_BG);
-        drawStatusBadge(62, 61, 44, ecoState == 2 ? "DIM" : "ECO", ecoColor);
-        lastEcoShown = ecoState;
-    }
-
-    bool wifiConnected = WiFi.status() == WL_CONNECTED;
-    int wifiBars = getWifiSignalBars();
-    int battery = getBatteryPercent();
-    int charging = isBatteryCharging() ? 1 : 0;
-    String clock = headerClockText();
-    if (force || wifiBars != lastHeaderWifiBars || wifiConnected != lastHeaderWifiConnected
-        || battery != lastHeaderBattery || charging != lastHeaderCharging || clock != lastHeaderClockShown) {
-        drawHeader("Now Playing");
-    }
-    lastPlayerRedraw = millis();
-}
-
-void drawHelpOverlay() {
-    M5Cardputer.Display.fillScreen(C_BG);
-    drawHeader("Controls");
-    drawSurface(9, 25, 222, 90);
-    int y = 35;
-    auto line = [&](const String &key, const String &text) {
-        M5Cardputer.Display.setTextColor(C_ACCENT, C_PANEL);
-        M5Cardputer.Display.setCursor(20, y);
-        M5Cardputer.Display.print(displayFit(key, 44));
-        M5Cardputer.Display.setTextColor(C_TEXT, C_PANEL);
-        M5Cardputer.Display.setCursor(72, y);
-        M5Cardputer.Display.print(displayFit(text, 145));
-        y += 18;
-    };
-
-    switch (screen) {
-        case Screen::FileList:
-            line("W / S", "Navigate list");
-            line("ENTER", "Open selection");
-            line("F / R", "Find / refresh");
-            line("N/Q/T", "NAS / WiFi / timer");
-            break;
-        case Screen::Player:
-            line("SPACE", "Play / pause");
-            line("+ / -", "Adjust volume");
-            line("N / P", "Next / previous");
-            line("B/M/T", "Library / eco / timer");
-            break;
-        case Screen::WifiList:
-            line("W / S", "Navigate networks");
-            line("ENTER", "Connect");
-            line("R", "Rescan networks");
-            line("TAB", "Return");
-            break;
-        default:
-            line("ENTER", "Confirm");
-            line("TAB", "Return");
-            line("DEL", "Erase");
-            break;
-    }
-
-    drawFooter("Any Key Close");
-}
-
-void drawTimerMenu() {
-    static const char *labels[] = {"Off", "15 min", "30 min", "1 hour", "2 hours"};
-    M5Cardputer.Display.fillScreen(C_BG);
-    drawHeader("Sleep timer");
-    M5Cardputer.Display.setTextColor(C_DIM, C_BG);
-    M5Cardputer.Display.setCursor(9, 25);
-    M5Cardputer.Display.print(shutdownAt == 0 ? "Turn off playback automatically"
-                                              : ("Remaining: " + timerRemainingText()));
-    for (int i = 0; i < 5; ++i) {
-        int y = 40 + i * 15;
-        bool sel = i == timerSelected;
-        uint16_t rowBg = sel ? C_SELECT : C_PANEL;
-        M5Cardputer.Display.fillRoundRect(8, y, 224, 13, 5, rowBg);
-        M5Cardputer.Display.setTextColor(C_TEXT, rowBg);
-        M5Cardputer.Display.setCursor(17, y + 2);
-        M5Cardputer.Display.print(labels[i]);
-        if (sel) {
-            M5Cardputer.Display.setTextColor(C_TEXT, rowBg);
-            M5Cardputer.Display.setCursor(181, y + 2);
-            M5Cardputer.Display.print("Selected");
-        }
-    }
-    drawFooter("Enter Set     Tab Back");
-    needsRedraw = false;
-}
-
-void applyTimerChoice() {
-    static const uint32_t seconds[] = {0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60};
-    uint32_t sec = seconds[timerSelected];
-    shutdownAt = sec == 0 ? 0 : millis() + sec * 1000UL;
-    showMessage("Timer", sec == 0 ? "Sleep timer off" : (String(sec / 60) + " min set"), 800,
-                mp3 ? Screen::Player : Screen::FileList);
-}
-
-void shutdownNow() {
-    stopPlayback();
-    M5Cardputer.Display.fillScreen(C_BG);
-    drawHeader("Power");
-    drawSurface(35, 38, 170, 58);
-    M5Cardputer.Display.fillCircle(58, 67, 12, C_ACCENT);
-    M5Cardputer.Display.drawCircle(58, 67, 6, C_TEXT);
-    M5Cardputer.Display.drawFastVLine(58, 56, 10, C_TEXT);
-    M5Cardputer.Display.setTextColor(C_TEXT, C_PANEL);
-    M5Cardputer.Display.setCursor(80, 54);
-    M5Cardputer.Display.print("Shutting down");
-    M5Cardputer.Display.setTextColor(C_DIM, C_PANEL);
-    M5Cardputer.Display.setCursor(80, 73);
-    M5Cardputer.Display.print("Sleep timer");
-    delay(300);
-    WiFi.disconnect(true, false);
-    M5Cardputer.Speaker.stop();
-    M5Cardputer.Power.powerOff();
-    delay(500);
-    esp_deep_sleep_start();
+bool isBack(const KeyEvent &k) {
+    return charInEvent(k, '`') || k.del;
 }
 
 void handleInput(const KeyEvent &key) {
-    markUserActivity();
     if (key.del) {
         removeLastUtf8(inputText);
         needsRedraw = true;
@@ -2140,22 +1637,13 @@ void handleInput(const KeyEvent &key) {
         }
     }
     if (key.tab) {
-        if (inputMode == InputMode::FileSearch) {
-            fileSearchQuery = "";
-            applyFileSearch();
-            screen = Screen::FileList;
-        } else if (inputMode == InputMode::NasUrl) {
-            screen = Screen::FileList;
-        } else {
-            screen = Screen::WifiList;
-        }
+        screen = (inputMode == InputMode::NasUrl && !entries.empty()) ? Screen::FileList : Screen::WifiList;
         needsRedraw = true;
         return;
     }
     if (!key.enter) {
         return;
     }
-
     if (inputMode == InputMode::ManualSsid) {
         pendingSsid = trimCopy(inputText);
         if (!pendingSsid.isEmpty()) {
@@ -2167,16 +1655,9 @@ void handleInput(const KeyEvent &key) {
         } else {
             showMessage("WiFi failed", "Check password or signal", 1600, Screen::WifiList);
         }
-    } else if (inputMode == InputMode::FileSearch) {
-        fileSearchQuery = trimCopy(inputText);
-        applyFileSearch();
-        screen = Screen::FileList;
-        needsRedraw = true;
     } else if (inputMode == InputMode::NasUrl) {
-        String url = normalizeNasUrl(inputText);
         drawBusyScreen("Library", "Loading files");
-        if (loadDirectory(url)) {
-            savedNas = currentUrl;
+        if (loadDirectory(inputText)) {
             screen = Screen::FileList;
             needsRedraw = true;
         } else {
@@ -2186,9 +1667,8 @@ void handleInput(const KeyEvent &key) {
 }
 
 void handleWifiList(const KeyEvent &key) {
-    markUserActivity();
-    if (key.tab && (wifiReturnScreen == Screen::FileList || wifiReturnScreen == Screen::Player)) {
-        screen = wifiReturnScreen == Screen::Player && mp3 ? Screen::Player : Screen::FileList;
+    if ((isBack(key) || key.tab) && WiFi.status() == WL_CONNECTED && !currentUrl.isEmpty()) {
+        screen = Screen::FileList;
         needsRedraw = true;
         return;
     }
@@ -2196,52 +1676,67 @@ void handleWifiList(const KeyEvent &key) {
         scanWifi();
         return;
     }
-    if (charInEvent(key, 'w') && wifiSelected > 0) {
+    if (isUp(key) && wifiSelected > 0) {
         --wifiSelected;
         needsRedraw = true;
     }
-    if (charInEvent(key, 's') && wifiSelected + 1 < static_cast<int>(wifiItems.size())) {
+    if (isDown(key) && wifiSelected + 1 < static_cast<int>(wifiItems.size())) {
         ++wifiSelected;
         needsRedraw = true;
     }
-    if (key.enter && wifiSelected >= 0 && wifiSelected < static_cast<int>(wifiItems.size())) {
-        WifiItem &item = wifiItems[wifiSelected];
-        if (item.manual) {
-            beginInput(InputMode::ManualSsid, "WiFi SSID", "", false);
-            return;
+    if (!key.enter || wifiSelected < 0 || wifiSelected >= static_cast<int>(wifiItems.size())) {
+        return;
+    }
+    WifiItem &item = wifiItems[wifiSelected];
+    if (item.manual) {
+        beginInput(InputMode::ManualSsid, "WiFi SSID", "", false);
+        return;
+    }
+    pendingSsid = item.ssid;
+    if (item.saved) {
+        inputText = savedPass;
+        if (connectWifi(pendingSsid, savedPass)) {
+            openSavedLibrary();
+        } else {
+            showMessage("WiFi failed", "Saved password failed", 1600, Screen::WifiList);
         }
-        pendingSsid = item.ssid;
-        if (item.saved) {
-            inputText = savedPass;
-            if (connectWifi(pendingSsid, savedPass)) {
-                beginInput(InputMode::NasUrl, "NAS address", savedNas.isEmpty() ? "http://" : savedNas, false);
-            } else {
-                showMessage("WiFi failed", "Saved password failed", 1600, Screen::WifiList);
-            }
-            return;
+        return;
+    }
+    if (item.enc == WIFI_AUTH_OPEN) {
+        inputText = "";
+        if (connectWifi(pendingSsid, "")) {
+            afterWifiConnected();
+        } else {
+            showMessage("WiFi failed", "Cannot connect", 1500, Screen::WifiList);
         }
-        if (item.enc == WIFI_AUTH_OPEN) {
-            inputText = "";
-            if (connectWifi(pendingSsid, "")) {
-                afterWifiConnected();
-            } else {
-                showMessage("WiFi failed", "Cannot connect", 1500, Screen::WifiList);
-            }
-            return;
-        }
-        beginInput(InputMode::WifiPassword, "WiFi password", "", true);
+        return;
+    }
+    beginInput(InputMode::WifiPassword, "WiFi password", "", true);
+}
+
+void openFolder(const String &url) {
+    drawBusyScreen("Library", "Opening folder");
+    if (!loadDirectory(url)) {
+        showMessage("NAS failed", "Cannot open folder", 1400, Screen::FileList);
+    } else {
+        needsRedraw = true;
     }
 }
 
 void handleFileList(const KeyEvent &key) {
-    markUserActivity();
-    if (charInEvent(key, 'q')) {
-        wifiReturnScreen = Screen::FileList;
-        scanWifi();
+    if (key.tab && playIndex >= 0) {
+        screen = Screen::Player;
+        needsRedraw = true;
         return;
     }
-    if (charInEvent(key, 'f')) {
-        beginInput(InputMode::FileSearch, "Search files", fileSearchQuery, false);
+    if (isBack(key)) {
+        if (!isRootUrl(currentUrl)) {
+            openFolder(parentUrlOf(currentUrl));
+        }
+        return;
+    }
+    if (charInEvent(key, 'q')) {
+        scanWifi();
         return;
     }
     if (charInEvent(key, 'n')) {
@@ -2249,73 +1744,45 @@ void handleFileList(const KeyEvent &key) {
         return;
     }
     if (charInEvent(key, 'r')) {
-        drawBusyScreen("Library", "Refreshing");
-        if (!loadDirectory(currentUrl)) {
-            showMessage("NAS failed", "Reload failed", 1200, Screen::FileList);
-        } else {
-            needsRedraw = true;
-        }
+        openFolder(currentUrl);
         return;
     }
-    if (charInEvent(key, 't')) {
-        screen = Screen::TimerMenu;
-        needsRedraw = true;
-        return;
-    }
-    if (charInEvent(key, 'w') && selected > 0) {
+    if (isUp(key) && selected > 0) {
         --selected;
         needsRedraw = true;
     }
-    if (charInEvent(key, 's') && selected + 1 < static_cast<int>(entries.size())) {
+    if (isDown(key) && selected + 1 < static_cast<int>(entries.size())) {
         ++selected;
         needsRedraw = true;
     }
     if (key.enter && selected >= 0 && selected < static_cast<int>(entries.size())) {
-        if (entries[selected].dir) {
-            String url = entries[selected].url;
-            drawBusyScreen("Library", "Opening folder");
-            if (!loadDirectory(url)) {
-                showMessage("NAS failed", "No MP3 files found", 1400, Screen::FileList);
-            } else {
-                needsRedraw = true;
-            }
+        const FileEntry &e = entries[selected];
+        if (e.dir) {
+            openFolder(entryUrl(e));
+        } else if (playIndex >= 0 && playlistDir == currentUrl && e.seg == playlist[playIndex]) {
+            screen = Screen::Player;  // already playing: go back to the player screen
+            needsRedraw = true;
         } else {
-            startPlayback(selected);
+            playFolderFrom(selected);
         }
     }
 }
 
 void handlePlayer(const KeyEvent &key) {
-    markUserActivity();
-    if (charInEvent(key, 'q')) {
-        stopPlayback();
-        wifiReturnScreen = Screen::FileList;
-        scanWifi();
+    if (isBack(key) || key.tab) {
+        screen = Screen::FileList;  // music keeps playing
+        needsRedraw = true;
         return;
     }
     if (key.space) {
-        if (mp3 && mp3->isRunning()) {
-            stopPlayback();
-            needsRedraw = true;
-        } else {
-            uint32_t resumeOffset = entries[selected].url == savedResumeUrl ? savedResumePos : 0;
-            startPlayback(selected, resumeOffset);
-        }
+        togglePause();
     }
-    if (charInEvent(key, 'b')) {
-        stopPlayback();
-        if (entries.size() == 1 && currentUrl.length() > 0) {
-            if (!ensurePlaybackFolderLoaded("Cannot load folder")) {
-                return;
-            }
-        }
-        screen = Screen::FileList;
-        needsRedraw = true;
+    if (charInEvent(key, 'n')) {
+        playFrom(playIndex + 1, true);
         return;
     }
-    if (charInEvent(key, 't')) {
-        screen = Screen::TimerMenu;
-        needsRedraw = true;
+    if (charInEvent(key, 'p')) {
+        playFrom(std::max(0, playIndex - (out.elapsedMs() > 3000 ? 0 : 1)), true);
         return;
     }
     if (charInEvent(key, '+') || charInEvent(key, '=')) {
@@ -2330,85 +1797,10 @@ void handlePlayer(const KeyEvent &key) {
         prefs.putUInt("volume", volume);
         needsRedraw = true;
     }
-    bool seekBack = (key.fn && charInEvent(key, ',')) || charInEvent(key, '<');
-    bool seekForward = (key.fn && charInEvent(key, '.')) || charInEvent(key, '>');
-    if (seekBack || seekForward) {
-        uint32_t target = computeSeekTarget(seekForward);
-        startPlayback(selected, target, false);
-        if (!(mp3 && mp3->isRunning())) {
-            startPlayback(selected, 0, true);
-            showMessage("Seek", "Range seek unsupported", 900, Screen::Player);
-        }
-        return;
-    }
-    if (charInEvent(key, 'n')) {
-        if (!ensurePlaybackFolderLoaded("Cannot load folder")) {
-            return;
-        }
-        int next = nextPlayableIndex(selected, 1);
-        if (next >= 0) {
-            startPlayback(next);
-        }
-    }
-    if (charInEvent(key, 'p')) {
-        if (!ensurePlaybackFolderLoaded("Cannot load folder")) {
-            return;
-        }
-        int prev = nextPlayableIndex(selected, -1);
-        if (prev >= 0) {
-            startPlayback(prev);
-        }
-    }
-    if (charInEvent(key, 'm')) {
-        powerSaveEnabled = !powerSaveEnabled;
-        prefs.putBool("eco", powerSaveEnabled);
-        if (!powerSaveEnabled) {
-            wakePlayerDisplay();
-            playerDimmed = false;
-            playerScreenOff = false;
-        }
-        drawPlayerDynamic(true);
-        return;
-    }
-}
-
-void handleTimerMenu(const KeyEvent &key) {
-    markUserActivity();
-    if (key.tab) {
-        screen = mp3 ? Screen::Player : Screen::FileList;
-        needsRedraw = true;
-        return;
-    }
-    if (charInEvent(key, 'w') && timerSelected > 0) {
-        --timerSelected;
-        needsRedraw = true;
-    }
-    if (charInEvent(key, 's') && timerSelected < 4) {
-        ++timerSelected;
-        needsRedraw = true;
-    }
-    if (key.enter) {
-        applyTimerChoice();
-    }
 }
 
 void dispatchKeys(const KeyEvent &key) {
     if (!key.pressed) {
-        return;
-    }
-    if (showHelpOverlay) {
-        showHelpOverlay = false;
-        needsRedraw = true;
-        return;
-    }
-    if (screen == Screen::Player && (playerDimmed || playerScreenOff)) {
-        wakePlayerDisplay();
-        lastUserActionAt = millis();
-        return;
-    }
-    if ((screen == Screen::FileList || screen == Screen::Player) && charInEvent(key, 'h')) {
-        showHelpOverlay = true;
-        needsRedraw = true;
         return;
     }
     switch (screen) {
@@ -2423,9 +1815,6 @@ void dispatchKeys(const KeyEvent &key) {
             break;
         case Screen::Player:
             handlePlayer(key);
-            break;
-        case Screen::TimerMenu:
-            handleTimerMenu(key);
             break;
         case Screen::Message:
             break;
@@ -2449,16 +1838,29 @@ void drawCurrentScreen() {
         case Screen::Player:
             drawPlayer();
             break;
-        case Screen::TimerMenu:
-            drawTimerMenu();
-            break;
         case Screen::Message:
             drawMessage();
             break;
     }
-    if (showHelpOverlay) {
-        drawHelpOverlay();
+}
+
+void allocateRing() {
+    static const size_t sizes[] = {96 * 1024, 80 * 1024, 64 * 1024, 48 * 1024, 32 * 1024};
+    for (size_t sz : sizes) {
+        Serial.printf("[ring] try %u: heap %u, max block %u\n", static_cast<unsigned>(sz), ESP.getFreeHeap(),
+                      static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+        // keep enough memory for Wi-Fi, the decoder and the folder list
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < sz || ESP.getFreeHeap() < sz + 150 * 1024) {
+            continue;
+        }
+        ringBuf = static_cast<uint8_t *>(heap_caps_malloc(sz, MALLOC_CAP_8BIT));
+        if (ringBuf) {
+            ringCap = sz;
+            return;
+        }
     }
+    ringBuf = static_cast<uint8_t *>(malloc(16 * 1024));
+    ringCap = ringBuf ? 16 * 1024 : 0;
 }
 
 }  // namespace
@@ -2466,34 +1868,43 @@ void drawCurrentScreen() {
 void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
-    M5Cardputer.Display.setRotation(1);
-    M5Cardputer.Display.setTextDatum(top_left);
-    M5Cardputer.Display.setTextWrap(false);
-    M5Cardputer.Display.setFont(&fonts::efontCN_12);
-    M5Cardputer.Display.setTextSize(1);
-    M5Cardputer.Display.setBrightness(DISPLAY_BRIGHTNESS_ACTIVE);
-    M5Cardputer.Display.fillScreen(C_BG);
+    auto &d = M5Cardputer.Display;
+    d.setRotation(1);
+    d.setTextDatum(top_left);
+    d.setTextWrap(false);
+    d.setFont(&fonts::efontCN_12);
+    d.setTextSize(1);
+    d.setBrightness(128);
+    d.fillScreen(C_BG);
+
+    auto spk = M5Cardputer.Speaker.config();
+    spk.task_pinned_core = APP_CPU_NUM;
+    spk.task_priority = 3;
+    M5Cardputer.Speaker.config(spk);
     M5Cardputer.Speaker.begin();
-    bootResetReason = esp_reset_reason();
 
     prefs.begin("nasmp3", false);
     savedSsid = prefs.getString("ssid", "");
     savedPass = prefs.getString("pass", "");
     savedNas = prefs.getString("nas", "");
-    savedResumeUrl = prefs.getString("resume_url", "");
-    savedResumePos = prefs.getUInt("resume_pos", 0);
     volume = static_cast<int>(prefs.getUInt("volume", volume));
-    powerSaveEnabled = prefs.getBool("eco", true);
-    lastUserActionAt = millis();
     M5Cardputer.Speaker.setVolume(volume);
 
-    if (!savedSsid.isEmpty() && !isAbnormalPlaybackReset(bootResetReason)) {
+    Serial.begin(115200);
+    allocateRing();
+    Serial.printf("[boot] ring %u bytes, heap %u\n", static_cast<unsigned>(ringCap), ESP.getFreeHeap());
+    netMutex = xSemaphoreCreateMutex();
+    decMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(netTask, "net", 4096, nullptr, 2, nullptr, PRO_CPU_NUM);
+    xTaskCreatePinnedToCore(decodeTask, "mp3", 16384, nullptr, 3, nullptr, PRO_CPU_NUM);
+
+    if (!savedSsid.isEmpty()) {
+        bootAutoStartPending = true;
         messageTitle = "Boot";
         messageBody = "Starting...";
         messageUntil = millis() + 600000UL;
         screen = Screen::Message;
         needsRedraw = true;
-        bootAutoStartPending = true;
     } else {
         scanWifi();
     }
@@ -2504,13 +1915,13 @@ void loop() {
 
     if (bootAutoStartPending) {
         bootAutoStartPending = false;
-        if (!tryAutoStart()) {
+        pendingSsid = savedSsid;
+        inputText = savedPass;
+        if (connectWifi(savedSsid, savedPass)) {
+            openSavedLibrary();
+        } else {
             scanWifi();
         }
-    }
-
-    if (shutdownAt != 0 && static_cast<int32_t>(millis() - shutdownAt) >= 0) {
-        shutdownNow();
     }
 
     if (screen == Screen::Message && static_cast<int32_t>(millis() - messageUntil) >= 0) {
@@ -2518,57 +1929,25 @@ void loop() {
         needsRedraw = true;
     }
 
-    if (mp3 && mp3->isRunning()) {
-        if (skipPlaybackLoopOnce) {
-            skipPlaybackLoopOnce = false;
+    // End of track: next one in the folder, or stop at the end of the folder.
+    if (playState.load() == PS_DONE) {
+        Serial.printf("[end] cuts %lu, net error %d, heap %u\n", static_cast<unsigned long>(underruns.load()),
+                      netError.load() ? 1 : 0, ESP.getFreeHeap());
+        if (netError.load()) {
+            finishPlaylist("Network error");
         } else {
-            persistPlaybackState(false);
-            if (!mp3->loop()) {
-                uint32_t playedMs = playbackStartedAt == 0 ? 0 : millis() - playbackStartedAt;
-                uint32_t playedPos = currentPlaybackPos();
-                stopPlayback(false);
-                if (playedMs < BAD_PLAYBACK_TIME_MS || playedPos < BAD_PLAYBACK_POS_BYTES) {
-                    clearResumeState();
-                    currentTrackUrl = "";
-                    currentTrackName = "";
-                    showMessage("Audio error", "Unsupported or bad MP3", 1500, Screen::FileList);
-                    return;
-                }
-                int next = nextPlayableIndex(selected, 1);
-                if (next >= 0) {
-                    startPlayback(next);
-                } else {
-                    clearResumeState();
-                    currentTrackUrl = "";
-                    screen = Screen::FileList;
-                    needsRedraw = true;
-                }
-            }
+            playFrom(playIndex + 1, false);
         }
     }
 
-    if (screen == Screen::Player && powerSaveEnabled) {
-        uint32_t idleMs = millis() - lastUserActionAt;
-        if (!playerDimmed && idleMs > POWER_SAVE_IDLE_MS) {
-            M5Cardputer.Display.setBrightness(DISPLAY_BRIGHTNESS_DIM);
-            playerDimmed = true;
-            playerScreenOff = false;
-            drawPlayerDynamic(true);
-        } else if (playerDimmed && !playerScreenOff && idleMs > POWER_SAVE_SCREEN_OFF_MS) {
-            M5Cardputer.Display.setBrightness(DISPLAY_BRIGHTNESS_OFF);
-            playerScreenOff = true;
-        }
-    }
-
-    if (screen == Screen::Player && !playerScreenOff) {
-        uint32_t refreshMs = playerDimmed ? 1500 : 250;
-        if (millis() - lastPlayerRedraw > refreshMs) {
-            drawPlayerDynamic(false);
-        }
+    static uint32_t lastDyn = 0;
+    if (screen == Screen::Player && !needsRedraw && millis() - lastDyn > 500) {
+        lastDyn = millis();
+        drawPlayerDynamic();
     }
 
     KeyEvent key = readKeys();
     dispatchKeys(key);
     drawCurrentScreen();
-    delay(2);
+    delay(5);
 }

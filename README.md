@@ -1,71 +1,77 @@
+# Cardputer ADV WebDAV MP3 Player (lite)
 
-# Cardputer-Adv NAS MP3 Player
+A stripped-down, glitch-free WebDAV / HTTP MP3 player for the **M5Stack Cardputer ADV** (ESP32-S3, no PSRAM).
+It streams MP3 files straight from a NAS or any WebDAV server over Wi-Fi: files of any size, up to 320 kbps.
 
-Firmware for M5Stack Cardputer-Adv that connects to WiFi, opens an HTTP/WebDAV NAS directory, lists folders and MP3 files, and streams selected MP3 tracks.
+Based on [CardputerADV-NAS-mp3player](https://github.com/HardCore-Gamer/CardputerADV-NAS-mp3player) 1.4.0 by HardCore-Gamer.
 
-The player keeps the last track URL, byte position, volume, and eco-mode setting in NVS. If the saved WiFi and NAS settings are still valid, boot reconnects to WiFi and returns to the last track screen. Playback is resumed manually from the player screen.
+## What is different from the original
 
-## Player UI
+- **No more stutter**: a network task streams the file into a large ring buffer (32-96 KB, depending on free RAM)
+  and a separate decode task feeds the speaker. Drawing the screen or reading the keyboard can no longer
+  interrupt the sound. The original decoded in the UI loop with an 8 KB buffer and stuttered on 320 kbps files.
+- **Real track duration**: read from the MP3 header (Xing / Info / VBRI frame count, or bitrate for CBR files).
+  The original assumed every file was 128 kbps.
+- **Clean folder names**: rewritten streaming PROPFIND parser. The original showed raw XML
+  (`<D:propstat><D:prop><D:displayname>...`) for most entries and stopped at 120 entries / 96 KB of XML;
+  this version lists up to 1000 entries per folder (as long as RAM allows).
+- **One folder = one playlist**: every MP3 of the folder is played in natural order ("2" before "10"),
+  then playback stops (the original looped forever).
+- **Browse while listening**: go back to the folder list without stopping the music, and return to the player.
+- **Stripped down**: search, sleep timer, eco/screen-off mode, resume on boot, seeking, NTP clock and help
+  screen were removed.
+- Diagnostics: the player shows the buffer fill level and the number of underruns ("cuts");
+  `[boot]`, `[play]` and `[end]` lines (free heap, buffer size, bitrate...) are printed on the USB serial port.
 
-- Top-right status area shows time, WiFi signal strength, and battery state.
-- Playback screen uses a compact three-band layout with track title, state, timer, progress bar, elapsed/total time, percentage, and volume bar.
-- The player screen no longer shows the local IP address.
-- The playback screen uses partial redraws instead of full-screen refreshes to reduce visible flicker, and the help panel blocks background progress updates cleanly.
-- File list and WiFi list use the same dark panel layout with simpler list-first presentation.
-- Shortcut details are hidden by default; press `h` to open the shortcut panel.
-<img width="800" height="600" alt="a5b37ddd-88fb-4317-a571-162c10b0c54a" src="https://github.com/user-attachments/assets/f86d2ff8-6583-4b59-9b20-378acad1d101" />
+## Controls
 
+**Folder list**
 
-## Power Saving
+| Key | Action |
+|---|---|
+| `;` / `.` (or `W` / `S`) | Move up / down (hold to scroll fast) |
+| `Enter` | Open folder / play the folder starting from this track |
+| `` ` `` or `Del` | Parent folder |
+| `Tab` | Back to the player screen (while something is playing) |
+| `N` | Change the server address |
+| `Q` | Wi-Fi networks |
+| `R` | Reload the folder |
 
-- Eco mode is enabled by default.
-- While music is playing, 15 seconds without input dims the display and reduces UI refresh frequency.
-- After a longer idle period, the screen turns fully off while audio playback continues.
-- Press any key once to wake the display, then press again for the intended action.
-- Press `m` on the player screen to toggle eco mode manually.
+**Player**
 
-## NAS URL
+| Key | Action |
+|---|---|
+| `Space` | Pause / resume |
+| `N` / `P` | Next / previous track (`P` restarts the track after 3 s) |
+| `+` / `-` | Volume |
+| `` ` ``, `Del` or `Tab` | Back to the folder list (music keeps playing) |
 
-Use an HTTP/WebDAV URL, for example:
+**Text fields** (Wi-Fi password, server address): `Enter` to confirm, `Del` to erase, `Tab` to go back.
 
-```text
+## Server address
+
+Plain HTTP only (no HTTPS), for example:
+
+```
 http://192.168.1.20:5005/music/
 http://user:password@192.168.1.20:5005/music/
 ```
 
-SMB/CIFS shares such as `\\NAS\music` are not supported by this ESP32 firmware. Enable WebDAV, a simple HTTP directory listing, or another local HTTP service on the NAS.
-
-## Controls
-
-- WiFi list / file list: `w` and `s` move, `Enter` selects.
-- Text input: type normally, `Backspace` deletes, `Enter` confirms, `Tab` cancels.
-- File list: `f` searches within the current folder.
-- File list: `q` opens WiFi selection, `r` reloads, `n` edits NAS URL, `t` opens sleep timer.
-- File list / player: `h` opens the shortcut panel.
-- Player: time, WiFi icon, battery icon, timer state, progress bar, elapsed/total time, percentage, volume bar, and ECO state are on screen.
-- Player: `Space` starts or resumes playback from the saved position.
-- Player: `Fn + ,` seek backward, `Fn + .` seek forward.
-- Player: `<` and `>` also trigger backward/forward seek.
-- Player: `+` and `-` change volume.
-- Player: `q` stops playback and opens WiFi selection.
-- Player: `n` next, `p` previous, `b` file list, `t` timer.
-- Player: `m` toggles eco mode.
-- WiFi list: `Tab` returns to the previous browser screen when opened from the library/player.
+The Wi-Fi network, the address and the last opened folder are saved and reopened at boot.
 
 ## Build
 
-```powershell
-python -m platformio run
+[PlatformIO](https://platformio.org/):
+
+```
+pio run
 ```
 
-The M5Launcher app binary is:
+`espressif32@6.7.0` (Arduino core 2.0.x), M5Cardputer, M5Unified, ESP8266Audio 1.9.9 (libmad MP3 decoder).
+The resulting `.pio/build/cardputer_adv_nas_mp3/firmware.bin` can be installed with
+[M5Launcher](https://github.com/bmorcelli/Launcher) from the SD card, or flashed at `0x10000`.
 
-```text
-.pio/build/cardputer_adv_nas_mp3/firmware.bin
-```
+## Credits
 
-A ready-to-copy build is also written to:
-
-```text
-cardputer_adv_nas_mp3.bin
-```
+- Original player: [HardCore-Gamer/CardputerADV-NAS-mp3player](https://github.com/HardCore-Gamer/CardputerADV-NAS-mp3player)
+- [ESP8266Audio](https://github.com/earlephilhower/ESP8266Audio), [M5Unified / M5Cardputer](https://github.com/m5stack)
