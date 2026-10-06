@@ -7,6 +7,7 @@
 // One folder = one playlist: every MP3 of the folder is played in order, then playback stops.
 #include <Arduino.h>
 #include <M5Cardputer.h>
+#include <utility/Adafruit_TCA8418/Adafruit_TCA8418.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -18,6 +19,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -59,10 +62,55 @@ struct ParsedUrl {
     String path = "/";
 };
 
-// Folder entry: only the last (encoded) path segment is stored to save memory;
-// the full URL is rebuilt from the current folder.
+// Names stored one after another in 4 KB blocks. With one String per entry
+// (kept percent-encoded: 6 bytes per Cyrillic letter), folders with 500+
+// entries ran out of memory and the end of the list was cut off.
+class NamePool {
+public:
+    static constexpr size_t BLOCK = 4096;
+
+    ~NamePool() { clear(); }
+
+    void clear() {
+        for (char *b : blocks_) {
+            free(b);
+        }
+        blocks_.clear();
+        blocks_.shrink_to_fit();
+        used_ = BLOCK;
+    }
+
+    // Copies `name`; false if there is not enough memory.
+    bool add(const char *name, uint32_t &ref) {
+        size_t n = strlen(name) + 1;
+        if (n > BLOCK) {
+            return false;
+        }
+        if (used_ + n > BLOCK) {
+            char *b = static_cast<char *>(malloc(BLOCK));
+            if (!b) {
+                return false;
+            }
+            blocks_.push_back(b);
+            used_ = 0;
+        }
+        ref = ((blocks_.size() - 1) << 12) | used_;
+        memcpy(blocks_.back() + used_, name, n);
+        used_ += n;
+        return true;
+    }
+
+    const char *get(uint32_t ref) const { return blocks_[ref >> 12] + (ref & 0xFFF); }
+
+private:
+    std::vector<char *> blocks_;
+    size_t used_ = BLOCK;
+};
+
+// Folder entry: only the decoded name is stored; the URL is rebuilt from the
+// current folder.
 struct FileEntry {
-    String seg;
+    uint32_t name = 0;  // in entryNames
     bool dir = false;
     bool parent = false;
 };
@@ -95,6 +143,7 @@ InputMode inputMode = InputMode::None;
 
 std::vector<WifiItem> wifiItems;
 std::vector<FileEntry> entries;
+NamePool entryNames;
 bool listTruncated = false;
 
 String savedSsid;
@@ -118,9 +167,11 @@ String messageBody;
 bool needsRedraw = true;
 bool bootAutoStartPending = false;
 
-// Playlist = the folder where playback was started.
+// Playlist = the folder where playback was started (names copied, the list
+// can change while the music plays).
 String playlistDir;
-std::vector<String> playlist;
+std::vector<uint32_t> playlist;
+NamePool playlistNames;
 int playIndex = -1;
 int failedInRow = 0;
 
@@ -142,7 +193,52 @@ void removeLastUtf8(String &value) {
     value.remove(i);
 }
 
+void appendUtf8(String &out, uint32_t cp) {
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+
+// Numeric references (&#1055; or &#x41F;) sent by some servers.
+String decodeNumericEntities(const String &value) {
+    if (value.indexOf("&#") < 0) {
+        return value;
+    }
+    String out;
+    out.reserve(value.length());
+    int i = 0;
+    int len = value.length();
+    while (i < len) {
+        int semi = value.indexOf(';', i);
+        if (value[i] == '&' && i + 2 < len && value[i + 1] == '#' && semi > i + 2 && semi - i < 12) {
+            bool hex = value[i + 2] == 'x' || value[i + 2] == 'X';
+            String digits = value.substring(i + (hex ? 3 : 2), semi);
+            uint32_t cp = strtoul(digits.c_str(), nullptr, hex ? 16 : 10);
+            if (cp > 0 && cp < 0x110000) {
+                appendUtf8(out, cp);
+                i = semi + 1;
+                continue;
+            }
+        }
+        out += value[i++];
+    }
+    return out;
+}
+
 String xmlHtmlDecode(String value) {
+    value = decodeNumericEntities(value);
     value.replace("&amp;", "&");
     value.replace("&lt;", "<");
     value.replace("&gt;", ">");
@@ -180,6 +276,47 @@ String percentDecode(const String &value) {
             }
         }
         out += c == '+' ? ' ' : c;
+    }
+    return out;
+}
+
+// Percent-decoding of a URL path: unlike percentDecode, '+' stays '+' (in a
+// path it is a real '+'). keepSlash leaves "%2F" encoded so that a '/' inside a
+// name is not mistaken for a folder separator.
+String pathDecode(const String &value, bool keepSlash = false) {
+    String out;
+    out.reserve(value.length());
+    for (int i = 0; i < static_cast<int>(value.length()); ++i) {
+        char c = value[i];
+        if (c == '%' && i + 2 < static_cast<int>(value.length())) {
+            int hi = hexValue(value[i + 1]);
+            int lo = hexValue(value[i + 2]);
+            if (hi >= 0 && lo >= 0 && !(keepSlash && ((hi << 4) | lo) == '/')) {
+                out += static_cast<char>((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+        }
+        out += c;
+    }
+    return out;
+}
+
+// Name -> URL path segment: everything except letters, digits and -._~ is
+// percent-encoded.
+String encodeSeg(const char *name) {
+    static const char *hex = "0123456789ABCDEF";
+    String out;
+    out.reserve(strlen(name) * 3);
+    for (const char *p = name; *p; ++p) {
+        uint8_t c = static_cast<uint8_t>(*p);
+        if (isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~') {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0x0F];
+        }
     }
     return out;
 }
@@ -329,13 +466,7 @@ String lastSegment(const String &url) {
 }
 
 String segToName(const String &seg) {
-    return percentDecode(xmlHtmlDecode(seg));
-}
-
-String segToUrlPart(const String &seg) {
-    String s = seg;
-    s.replace(" ", "%20");
-    return s;
+    return pathDecode(xmlHtmlDecode(seg));
 }
 
 String parentUrlOf(const String &url) {
@@ -366,8 +497,8 @@ bool samePathUrl(const String &a, const String &b) {
     if (!pa.ok || !pb.ok) {
         return a == b;
     }
-    String ap = cleanUrlPath(pa.path);
-    String bp = cleanUrlPath(pb.path);
+    String ap = pathDecode(cleanUrlPath(pa.path), true);
+    String bp = pathDecode(cleanUrlPath(pb.path), true);
     if (!ap.endsWith("/")) {
         ap += "/";
     }
@@ -383,8 +514,9 @@ bool isDirectChildUrl(const String &baseUrl, const String &targetUrl, bool direc
     if (!base.ok || !target.ok || base.host != target.host || base.port != target.port) {
         return false;
     }
-    String basePath = cleanUrlPath(base.path);
-    String targetPath = cleanUrlPath(target.path);
+    // decoded: the server may not encode names the way we do
+    String basePath = pathDecode(cleanUrlPath(base.path), true);
+    String targetPath = pathDecode(cleanUrlPath(target.path), true);
     if (!basePath.endsWith("/")) {
         basePath += "/";
     }
@@ -402,34 +534,38 @@ bool pathIsMp3(const String &urlOrPath) {
     return toLowerCopy(cleanUrlPath(urlOrPath)).endsWith(".mp3");
 }
 
-// "Natural" sort: "2 - x" before "10 - x".
-bool naturalLess(const String &a, const String &b) {
-    size_t i = 0;
-    size_t j = 0;
-    while (i < a.length() && j < b.length()) {
-        char ca = a[i];
-        char cb = b[j];
-        if (isdigit(static_cast<unsigned char>(ca)) && isdigit(static_cast<unsigned char>(cb))) {
+// "Natural" sort, ignoring case: "2 - x" before "10 - x".
+bool naturalLess(const char *a, const char *b) {
+    while (*a && *b) {
+        unsigned char ca = static_cast<unsigned char>(*a);
+        unsigned char cb = static_cast<unsigned char>(*b);
+        if (isdigit(ca) && isdigit(cb)) {
             uint32_t na = 0;
             uint32_t nb = 0;
-            while (i < a.length() && isdigit(static_cast<unsigned char>(a[i]))) {
-                na = na * 10 + (a[i++] - '0');
+            while (isdigit(static_cast<unsigned char>(*a))) {
+                na = na * 10 + (*a++ - '0');
             }
-            while (j < b.length() && isdigit(static_cast<unsigned char>(b[j]))) {
-                nb = nb * 10 + (b[j++] - '0');
+            while (isdigit(static_cast<unsigned char>(*b))) {
+                nb = nb * 10 + (*b++ - '0');
             }
             if (na != nb) {
                 return na < nb;
             }
             continue;
         }
-        if (ca != cb) {
-            return static_cast<unsigned char>(ca) < static_cast<unsigned char>(cb);
+        if (ca < 0x80) {
+            ca = static_cast<unsigned char>(tolower(ca));
         }
-        ++i;
-        ++j;
+        if (cb < 0x80) {
+            cb = static_cast<unsigned char>(tolower(cb));
+        }
+        if (ca != cb) {
+            return ca < cb;
+        }
+        ++a;
+        ++b;
     }
-    return a.length() - i < b.length() - j;
+    return *a == 0 && *b != 0;
 }
 
 String formatTime(uint32_t ms) {
@@ -830,6 +966,138 @@ String tailFit(String value, int width) {
     return "..." + value;
 }
 
+// Characters missing from the font would show as empty boxes: combining
+// accents (names written in decomposed form) are merged with their letter,
+// some Cyrillic letters get a look-alike, anything else becomes '?'.
+uint32_t composeAccent(uint32_t base, uint32_t mark) {
+    struct Combo {
+        uint16_t mark;
+        const char *bases;
+        uint16_t first[12];
+    };
+    static const Combo combos[] = {
+        {0x0300, "AEIOUaeiou", {0xC0, 0xC8, 0xCC, 0xD2, 0xD9, 0xE0, 0xE8, 0xEC, 0xF2, 0xF9}},
+        {0x0301, "AEIOUYaeiouy", {0xC1, 0xC9, 0xCD, 0xD3, 0xDA, 0xDD, 0xE1, 0xE9, 0xED, 0xF3, 0xFA, 0xFD}},
+        {0x0302, "AEIOUaeiou", {0xC2, 0xCA, 0xCE, 0xD4, 0xDB, 0xE2, 0xEA, 0xEE, 0xF4, 0xFB}},
+        {0x0303, "ANOano", {0xC3, 0xD1, 0xD5, 0xE3, 0xF1, 0xF5}},
+        {0x0308, "AEIOUaeiouy", {0xC4, 0xCB, 0xCF, 0xD6, 0xDC, 0xE4, 0xEB, 0xEF, 0xF6, 0xFC, 0xFF}},
+        {0x030A, "Aa", {0xC5, 0xE5}},
+        {0x0327, "Cc", {0xC7, 0xE7}},
+    };
+    if (base < 0x80) {
+        for (const auto &c : combos) {
+            if (c.mark != mark) {
+                continue;
+            }
+            const char *p = strchr(c.bases, static_cast<char>(base));
+            if (p && base) {
+                return c.first[p - c.bases];
+            }
+        }
+    }
+    if (mark == 0x0306) {  // breve: й Й ў Ў
+        if (base == 0x0438) return 0x0439;
+        if (base == 0x0418) return 0x0419;
+        if (base == 0x0443) return 0x045E;
+        if (base == 0x0423) return 0x040E;
+    }
+    if (mark == 0x0308) {  // diaeresis: ё Ё ї Ї
+        if (base == 0x0435) return 0x0451;
+        if (base == 0x0415) return 0x0401;
+        if (base == 0x0456) return 0x0457;
+        if (base == 0x0406) return 0x0407;
+    }
+    return 0;
+}
+
+const char *lookAlike(uint32_t cp) {
+    switch (cp) {
+        case 0x0400: return "\xC3\x88";  // Ѐ -> È
+        case 0x0402: return "Dj";
+        case 0x0403: return "\xD0\x93";  // Ѓ -> Г
+        case 0x0404: return "\xD0\x95";  // Є -> Е
+        case 0x0405: return "S";
+        case 0x0406: return "I";
+        case 0x0407: return "\xC3\x8F";  // Ї -> Ï
+        case 0x0408: return "J";
+        case 0x0409: return "Lj";
+        case 0x040A: return "Nj";
+        case 0x040B: return "C";
+        case 0x040C: return "\xD0\x9A";  // Ќ -> К
+        case 0x040D: return "\xD0\x98";  // Ѝ -> И
+        case 0x040E: return "\xD0\xA3";  // Ў -> У
+        case 0x040F: return "Dz";
+        case 0x0450: return "\xC3\xA8";  // ѐ -> è
+        case 0x0452: return "dj";
+        case 0x0453: return "\xD0\xB3";  // ѓ -> г
+        case 0x0454: return "\xD0\xB5";  // є -> е
+        case 0x0455: return "s";
+        case 0x0456: return "i";
+        case 0x0457: return "\xC3\xAF";  // ї -> ï
+        case 0x0458: return "j";
+        case 0x0459: return "lj";
+        case 0x045A: return "nj";
+        case 0x045B: return "c";
+        case 0x045C: return "\xD0\xBA";  // ќ -> к
+        case 0x045D: return "\xD0\xB8";  // ѝ -> и
+        case 0x045E: return "\xD1\x83";  // ў -> у
+        case 0x045F: return "dz";
+        case 0x0490: return "\xD0\x93";  // Ґ -> Г
+        case 0x0491: return "\xD0\xB3";  // ґ -> г
+        default: return nullptr;
+    }
+}
+
+String displayName(const char *s) {
+    const lgfx::IFont *font = M5Cardputer.Display.getFont();
+    lgfx::FontMetrics m;
+    std::vector<uint32_t> cps;
+    const uint8_t *p = reinterpret_cast<const uint8_t *>(s);
+    while (*p) {
+        uint32_t cp = '?';
+        int extra = 0;
+        if (*p < 0x80) {
+            cp = *p;
+        } else if ((*p & 0xE0) == 0xC0) {
+            cp = *p & 0x1F;
+            extra = 1;
+        } else if ((*p & 0xF0) == 0xE0) {
+            cp = *p & 0x0F;
+            extra = 2;
+        } else if ((*p & 0xF8) == 0xF0) {
+            cp = *p & 0x07;
+            extra = 3;
+        }
+        ++p;
+        for (int k = 0; k < extra; ++k) {
+            if ((*p & 0xC0) != 0x80) {
+                cp = '?';
+                break;
+            }
+            cp = (cp << 6) | (*p++ & 0x3F);
+        }
+        if (cp >= 0x0300 && cp <= 0x036F) {  // combining accent
+            uint32_t c = cps.empty() ? 0 : composeAccent(cps.back(), cp);
+            if (c) {
+                cps.back() = c;
+            }
+            continue;
+        }
+        cps.push_back(cp);
+    }
+    String out;
+    for (uint32_t cp : cps) {
+        if (cp < 0x80 || (cp <= 0xFFFF && font && font->updateFontMetric(&m, cp))) {
+            appendUtf8(out, cp);
+        } else if (const char *alt = lookAlike(cp)) {
+            out += alt;
+        } else {
+            out += '?';
+        }
+    }
+    return out;
+}
+
 bool charInEvent(const KeyEvent &key, char wanted) {
     char w = static_cast<char>(tolower(static_cast<unsigned char>(wanted)));
     for (char c : key.chars) {
@@ -994,16 +1262,20 @@ void addEntryIfUseful(const String &baseUrl, String href, bool forceDir) {
         listTruncated = true;
         return;
     }
-    FileEntry entry;
-    entry.seg = lastSegment(joined);
-    entry.dir = dir;
-    if (entry.seg.isEmpty()) {
+    String name = pathDecode(lastSegment(joined));
+    if (name.isEmpty()) {
         return;
     }
     for (const auto &e : entries) {
-        if (e.seg == entry.seg && e.dir == entry.dir) {
+        if (!e.parent && e.dir == dir && strcmp(entryNames.get(e.name), name.c_str()) == 0) {
             return;
         }
+    }
+    FileEntry entry;
+    entry.dir = dir;
+    if (!entryNames.add(name.c_str(), entry.name)) {
+        listTruncated = true;
+        return;
     }
     entries.push_back(entry);
 }
@@ -1137,43 +1409,42 @@ bool fetchWebDavListing(const String &url) {
 }
 
 void sortEntries() {
-    std::vector<String> keys;
-    keys.reserve(entries.size());
-    for (const auto &e : entries) {
-        keys.push_back(toLowerCopy(segToName(e.seg)));
-    }
-    std::vector<size_t> order(entries.size());
-    for (size_t i = 0; i < order.size(); ++i) {
-        order[i] = i;
-    }
-    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        if (entries[a].parent != entries[b].parent) {
-            return entries[a].parent;
+    std::sort(entries.begin(), entries.end(), [](const FileEntry &a, const FileEntry &b) {
+        if (a.parent != b.parent) {
+            return a.parent;
         }
-        if (entries[a].dir != entries[b].dir) {
-            return entries[a].dir;
+        if (a.dir != b.dir) {
+            return a.dir;
         }
-        return naturalLess(keys[a], keys[b]);
+        return naturalLess(entryNames.get(a.name), entryNames.get(b.name));
     });
-    std::vector<FileEntry> sorted;
-    sorted.reserve(entries.size());
-    for (size_t i : order) {
-        sorted.push_back(std::move(entries[i]));
-    }
-    entries = std::move(sorted);
+}
+
+const char *entryName(const FileEntry &e) {
+    return e.parent ? "" : entryNames.get(e.name);
+}
+
+const char *playlistName(int index) {
+    return playlistNames.get(playlist[index]);
+}
+
+bool isPlayingEntry(const FileEntry &e) {
+    return playIndex >= 0 && playlistDir == currentUrl && !e.dir && !e.parent &&
+           strcmp(entryName(e), playlistName(playIndex)) == 0;
 }
 
 String entryUrl(const FileEntry &e) {
     if (e.parent) {
         return parentUrlOf(currentUrl);
     }
-    return currentUrl + segToUrlPart(e.seg) + (e.dir ? "/" : "");
+    return currentUrl + encodeSeg(entryName(e)) + (e.dir ? "/" : "");
 }
 
 bool loadDirectory(const String &rawUrl) {
     String url = normalizeDirUrl(rawUrl);
     entries.clear();
     entries.shrink_to_fit();
+    entryNames.clear();
     listTruncated = false;
     selected = 0;
     scrollTop = 0;
@@ -1193,12 +1464,10 @@ bool loadDirectory(const String &rawUrl) {
     prefs.putString("nas", currentUrl);
     savedNas = currentUrl;
     // If this is the folder being played, select the current track.
-    if (playIndex >= 0 && playlistDir == currentUrl) {
-        for (size_t i = 0; i < entries.size(); ++i) {
-            if (!entries[i].dir && entries[i].seg == playlist[playIndex]) {
-                selected = i;
-                break;
-            }
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (isPlayingEntry(entries[i])) {
+            selected = i;
+            break;
         }
     }
     return true;
@@ -1210,6 +1479,7 @@ void finishPlaylist(const String &why) {
     stopTrack();
     playIndex = -1;
     playlist.clear();
+    playlistNames.clear();
     playlistDir = "";
     showMessage("Library", why, 1500, Screen::FileList);
 }
@@ -1220,7 +1490,7 @@ bool startTrack(int index, bool showPlayer) {
         return false;
     }
     playIndex = index;
-    trackName = segToName(playlist[index]);
+    trackName = displayName(playlistName(index));
     trackDurationMs = 0;
     trackKbps = 0;
     underruns.store(0);
@@ -1228,7 +1498,7 @@ bool startTrack(int index, bool showPlayer) {
         drawBusyScreen("Now Playing", trackName);
     }
 
-    if (!openStream(playlistDir + segToUrlPart(playlist[index]))) {
+    if (!openStream(playlistDir + encodeSeg(playlistName(index)))) {
         return false;
     }
     // ID3v2 tag (title, cover art...): skip it.
@@ -1319,15 +1589,22 @@ void playFrom(int index, bool showPlayer) {
 }
 
 void playFolderFrom(int entryIndex) {
+    stopTrack();
+    playIndex = -1;
     playlist.clear();
+    playlistNames.clear();
     playlistDir = currentUrl;
     int start = 0;
     for (size_t i = 0; i < entries.size(); ++i) {
         if (!entries[i].dir) {
+            uint32_t ref;
+            if (!playlistNames.add(entryName(entries[i]), ref)) {
+                break;  // not enough memory: the playlist stops here
+            }
             if (static_cast<int>(i) == entryIndex) {
                 start = playlist.size();
             }
-            playlist.push_back(entries[i].seg);
+            playlist.push_back(ref);
         }
     }
     playFrom(start, true);
@@ -1388,7 +1665,7 @@ void drawPlayer() {
     d.print(displayFit(trackName, 224));
     d.setTextColor(C_DIM, C_BG);
     d.setCursor(8, 43);
-    d.print(displayFit(String(playIndex + 1) + "/" + String(playlist.size()) + "  " + segToName(lastSegment(playlistDir)), 224));
+    d.print(displayFit(String(playIndex + 1) + "/" + String(playlist.size()) + "  " + displayName(segToName(lastSegment(playlistDir)).c_str()), 224));
     drawPlayerDynamic();
     drawFooter("Space Pause  N/P Track  ` Library");
     needsRedraw = false;
@@ -1398,7 +1675,7 @@ void drawFileList() {
     auto &d = M5Cardputer.Display;
     d.fillScreen(C_BG);
     drawHeader("Library");
-    String location = isRootUrl(currentUrl) ? String("/") : segToName(lastSegment(currentUrl));
+    String location = isRootUrl(currentUrl) ? String("/") : displayName(segToName(lastSegment(currentUrl)).c_str());
     d.setTextColor(C_DIM, C_BG);
     d.setCursor(9, 24);
     d.print(displayFit(location, 180));
@@ -1414,7 +1691,6 @@ void drawFileList() {
     if (selected >= scrollTop + visible) {
         scrollTop = selected - visible + 1;
     }
-    bool playingHere = playIndex >= 0 && playlistDir == currentUrl;
     for (int row = 0; row < visible; ++row) {
         int idx = scrollTop + row;
         if (idx >= static_cast<int>(entries.size())) {
@@ -1423,13 +1699,13 @@ void drawFileList() {
         const FileEntry &e = entries[idx];
         int y = listTop + row * 13;
         bool sel = idx == selected;
-        bool playing = playingHere && !e.dir && e.seg == playlist[playIndex];
+        bool playing = isPlayingEntry(e);
         uint16_t rowBg = sel ? C_SELECT : C_PANEL;
         d.fillRoundRect(8, y, 224, 12, 5, rowBg);
         uint16_t fg = sel ? C_TEXT : (playing ? C_GOOD : (e.dir ? C_ACCENT : C_TEXT));
         d.setTextColor(fg, rowBg);
         d.setCursor(16, y + 2);
-        String label = e.parent ? String("[..]") : String(playing ? "> " : "") + segToName(e.seg);
+        String label = e.parent ? String("[..]") : String(playing ? "> " : "") + displayName(entryName(e));
         d.print(displayFit(label, 205));
     }
     if (entries.empty()) {
@@ -1759,7 +2035,7 @@ void handleFileList(const KeyEvent &key) {
         const FileEntry &e = entries[selected];
         if (e.dir) {
             openFolder(entryUrl(e));
-        } else if (playIndex >= 0 && playlistDir == currentUrl && e.seg == playlist[playIndex]) {
+        } else if (isPlayingEntry(e)) {
             screen = Screen::Player;  // already playing: go back to the player screen
             needsRedraw = true;
         } else {
@@ -1863,16 +2139,64 @@ void allocateRing() {
     ringCap = ringBuf ? 16 * 1024 : 0;
 }
 
+// Cardputer ADV keyboard read on every loop. The M5Cardputer library reader
+// waits for the TCA8418 interrupt: if a key arrives at the wrong moment, the
+// interrupt is lost and the keyboard stops responding (the app keeps running).
+class PolledKeyboardReader : public KeyboardReader {
+public:
+    void begin() override {
+        _ok = _tca.begin();
+        if (_ok) {
+            _tca.matrix(7, 8);
+            _tca.flush();
+        }
+    }
+
+    void update() override {
+        if (!_ok) {
+            return;
+        }
+        for (uint8_t ev = _tca.getEvent(); ev != 0; ev = _tca.getEvent()) {
+            int code = (ev & 0x7F) - 1;
+            int r = code / 10;
+            int c = code % 10;
+            if (code < 0 || r >= 7 || c >= 8) {
+                continue;
+            }
+            Point2D_t p;  // same layout as the library
+            p.x = r * 2 + (c > 3 ? 1 : 0);
+            p.y = (c + 4) % 4;
+            auto it = std::find(_key_list.begin(), _key_list.end(), p);
+            if (ev & 0x80) {
+                if (it == _key_list.end()) {
+                    _key_list.push_back(p);
+                }
+            } else if (it != _key_list.end()) {
+                _key_list.erase(it);
+            }
+        }
+    }
+
+private:
+    Adafruit_TCA8418 _tca;
+    bool _ok = false;
+};
+
 }  // namespace
 
 void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
+    if (M5.getBoard() == m5::board_t::board_M5CardputerADV) {
+        // Replace the library keyboard reader (see PolledKeyboardReader)
+        detachInterrupt(digitalPinToInterrupt(11));
+        M5Cardputer.Keyboard.begin(std::unique_ptr<KeyboardReader>(new PolledKeyboardReader()));
+    }
     auto &d = M5Cardputer.Display;
     d.setRotation(1);
     d.setTextDatum(top_left);
     d.setTextWrap(false);
-    d.setFont(&fonts::efontCN_12);
+    d.setFont(&fonts::efontJA_12);  // also has É, Ç, À... (efontCN_12 did not)
     d.setTextSize(1);
     d.setBrightness(128);
     d.fillScreen(C_BG);

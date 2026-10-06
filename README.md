@@ -17,6 +17,15 @@ Based on [CardputerADV-NAS-mp3player](https://github.com/HardCore-Gamer/Cardpute
   this version lists up to 1000 entries per folder (as long as RAM allows).
 - **One folder = one playlist**: every MP3 of the folder is played in natural order ("2" before "10"),
   then playback stops (the original looped forever).
+- **Large folders**: names are stored decoded, packed in 4 KB blocks (they were kept percent-encoded, one
+  String each: 6 bytes per Cyrillic letter), so folders with 500+ entries are no longer cut off.
+- **Russian, accented and other special names**: font with Cyrillic and all Latin-1 accents (`efontJA_12`);
+  letters still missing from the font get a look-alike (`Ї` -> `Ï`, `Ґ` -> `Г`...) or `?` instead of an empty box,
+  decomposed accents (`e` + `´`) are merged, `+` in names is kept, numeric XML entities (`&#1055;`) are decoded,
+  and URLs are rebuilt with standard percent-encoding.
+- **Keyboard never freezes**: the keys are read on every loop. The M5Cardputer library waits for the
+  TCA8418 keyboard interrupt, which can get lost when a key arrives at the wrong moment: the keyboard then
+  stopped responding while the app kept running.
 - **Browse while listening**: go back to the folder list without stopping the music, and return to the player.
 - **Stripped down**: search, sleep timer, eco/screen-off mode, resume on boot, seeking, NTP clock and help
   screen were removed.
